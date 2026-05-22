@@ -663,8 +663,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     cu_seqlens_cmp_kv=None,
                     seqused_q=self.seqused_q,
                     seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_kv=max_seq_lens,
                     batch_size=len(self.seq_lens[reqs_start:]),
                     cmp_ratio=1,
                     ori_mask_mode=4,  # 4:sliding window
@@ -688,8 +688,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     cu_seqlens_cmp_kv=cu_c4_cmp_seqlen_list,
                     seqused_q=self.seqused_q,
                     seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_kv=max_seq_lens,
                     batch_size=len(self.seq_lens[reqs_start:]),
                     cmp_topk=index_topk,
                     # topk=index_topk,
@@ -716,8 +716,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     cu_seqlens_cmp_kv=cu_c128_cmp_seqlen_list,
                     seqused_q=self.seqused_q,
                     seqused_kv=self.seq_lens[reqs_start:],
-                    max_seqlen_q=seq_lens_q.max(),
-                    max_seqlen_kv=self.seq_lens[reqs_start:].max(),
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_kv=max_seq_lens,
                     batch_size=len(self.seq_lens[reqs_start:]),
                     cmp_ratio=128,  #
                     ori_mask_mode=4,  # 4:sliding window
@@ -741,8 +741,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 query_quant_mode=0,
                 key_quant_mode=0,
                 batch_size=len(self.seq_lens[reqs_start:]),
-                max_seqlen_q=seq_lens_q.max().item(),
-                max_seqlen_k=self.seq_lens[reqs_start:].max().item(),
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_seq_lens,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=self.model_config.hf_config.index_topk,  # 512

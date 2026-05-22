@@ -69,6 +69,7 @@ def set_ascend_forward_context(
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
     input_ids=None,
+    with_prefill: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -100,6 +101,7 @@ def set_ascend_forward_context(
         tp_world_size = get_tensor_model_parallel_world_size()
 
         forward_context.in_profile_run = in_profile_run
+        forward_context.with_prefill = with_prefill
 
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing

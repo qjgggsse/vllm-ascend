@@ -1943,6 +1943,7 @@ class NPUModelRunner(GPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
                 input_ids=input_ids,
+                with_prefill=self.with_prefill,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

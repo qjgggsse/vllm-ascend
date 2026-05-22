@@ -44,6 +44,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.deepseek_compressor import CompressorStateCache
 from vllm.model_executor.layers.deepseek_v4_attention import DeepseekV4IndexerCache
@@ -933,8 +934,10 @@ class DeepseekV4Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        # Skip during prefill since the drafter only runs in decode-only batches.
         num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        if not getattr(get_forward_context(), 'with_prefill', False):
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         if not get_pp_group().is_last_rank:
