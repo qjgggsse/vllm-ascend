@@ -1652,12 +1652,14 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         hidden_states: [N/tp, dim] local SP partition.
         Returns: (q, qr, full_hidden_states)
-          - q: [N, n_local_heads, head_dim] with RoPE applied
-          - qr: [N, q_lora_rank] for indexer
-          - full_hidden_states: [N, dim] for compressor
+          - q: [actual_tokens, n_local_heads, head_dim] with RoPE applied
+          - qr: [actual_tokens, q_lora_rank] for indexer
+          - full_hidden_states: [actual_tokens, dim] for compressor
         """
         main_stream = torch.npu.current_stream()
         aux_stream = dsv4_dsa_overlap_stream()
+        # cos.shape[0] == num_actual_tokens (prefill tokens without padding)
+        num_actual_tokens = cos.shape[0]
 
         # Part1: q_a_down[C] || kv_quant[V]
         q_quant, q_pertoken_scale = self.cv_wq_a.quantize(hidden_states)
@@ -1680,7 +1682,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             kv = self.kv_norm(kv)
 
         qr = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-            qr, True)  # [N, q_lora_rank]
+            qr, True)  # [N_padded, q_lora_rank]
+        qr = qr[:num_actual_tokens]  # [actual_tokens, q_lora_rank]
         main_stream.wait_stream(aux_stream)
 
         # Part3: wq_b + q_rms || allgather(kv) + allgather(hidden_states)
@@ -1689,11 +1692,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         with npu_stream_switch(aux_stream, enabled=True):
             torch.npu.current_stream().wait_event(e_part3)
             kv = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-                kv, True)  # [N, head_dim]
+                kv, True)
+            kv = kv[:num_actual_tokens]
             if self.compress_ratio > 1:
                 full_hidden_states = (
                     torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-                        hidden_states, True))  # [N, dim]
+                        hidden_states, True))
+                full_hidden_states = full_hidden_states[:num_actual_tokens]
             else:
                 full_hidden_states = hidden_states
 
