@@ -1658,55 +1658,54 @@ class AscendDSAImpl(DSAAttentionImpl):
         """
         main_stream = torch.npu.current_stream()
         aux_stream = dsv4_dsa_overlap_stream()
-        # cos.shape[0] == num_actual_tokens (prefill tokens without padding)
         num_actual_tokens = cos.shape[0]
 
-        # Part1: q_a_down[C] || kv_quant[V]
+        # === Phase 1: q_a_down [main/C] || kv_quant [aux/V] ===
         q_quant, q_pertoken_scale = self.cv_wq_a.quantize(hidden_states)
-        e_part1 = main_stream.record_event()
+        e_phase1 = main_stream.record_event()
 
         with npu_stream_switch(aux_stream, enabled=True):
-            torch.npu.current_stream().wait_event(e_part1)
+            torch.npu.current_stream().wait_event(e_phase1)
             kv_quant, kv_pertoken_scale = self.cv_wkv.quantize(hidden_states)
 
         q_a_down = self.cv_wq_a.matmul(q_quant, q_pertoken_scale)
-        main_stream.wait_stream(aux_stream)
+        qr = self.q_norm(q_a_down)
 
-        # Part2: allgather(qr) || kv_proj + kv_norm
-        qr = self.q_norm(q_a_down)  # [N/tp, q_lora_rank]
-        e_part2 = main_stream.record_event()
+        # === Phase 2: allgather(qr) [main/comm] || kv_proj + kv_norm [aux/compute] ===
+        e_phase2 = main_stream.record_event()
 
         with npu_stream_switch(aux_stream, enabled=True):
-            torch.npu.current_stream().wait_event(e_part2)
+            torch.npu.current_stream().wait_event(e_phase2)
             kv = self.cv_wkv.matmul(kv_quant, kv_pertoken_scale)
             kv = self.kv_norm(kv)
 
-        qr = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-            qr, True)  # [N_padded, q_lora_rank]
-        qr = qr[:num_actual_tokens]  # [actual_tokens, q_lora_rank]
+        qr = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(qr, True)
+        qr = qr[:num_actual_tokens]
         main_stream.wait_stream(aux_stream)
 
-        # Part3: wq_b + q_rms || allgather(kv) + allgather(hidden_states)
-        e_part3 = main_stream.record_event()
+        # === Phase 3: allgather(kv)+allgather(hs) [main/comm] || wq_b+q_rms [aux/compute] ===
+        e_phase3 = main_stream.record_event()
 
         with npu_stream_switch(aux_stream, enabled=True):
-            torch.npu.current_stream().wait_event(e_part3)
-            kv = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-                kv, True)
-            kv = kv[:num_actual_tokens]
-            if self.compress_ratio > 1:
-                full_hidden_states = (
-                    torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-                        hidden_states, True))
-                full_hidden_states = full_hidden_states[:num_actual_tokens]
-            else:
-                full_hidden_states = hidden_states
+            torch.npu.current_stream().wait_event(e_phase3)
+            q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
+            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(
+                -1, (self.n_local_heads, self.head_dim))
+            q = triton_q_rms(q, self.eps)
 
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q = triton_q_rms(q, self.eps)
+        kv = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv, True)
+        kv = kv[:num_actual_tokens]
+        if self.compress_ratio > 1:
+            full_hidden_states = (
+                torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                    hidden_states, True))
+            full_hidden_states = full_hidden_states[:num_actual_tokens]
+        else:
+            full_hidden_states = hidden_states
+
         main_stream.wait_stream(aux_stream)
 
-        # Tail: q_rope + kv_rope + scatter (serial)
+        # === Tail: q_rope + kv_rope + scatter (main stream, serial) ===
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1), cos, sin,
             rotary_mode="interleave",
