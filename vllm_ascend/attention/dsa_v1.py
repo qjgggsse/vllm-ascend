@@ -1683,9 +1683,16 @@ class AscendDSAImpl(DSAAttentionImpl):
             qr, True)  # [N, q_lora_rank]
         main_stream.wait_stream(aux_stream)
 
-        # Part3: wq_b + q_rms, then allgather(kv) + allgather(hidden_states)
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q = triton_q_rms(q, self.eps)
+        # Part3: allgather(kv) + allgather(hidden_states) || wq_b + q_rms
+        q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
+        e_part3 = main_stream.record_event()
+
+        with npu_stream_switch(aux_stream, enabled=True):
+            torch.npu.current_stream().wait_event(e_part3)
+            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(
+                -1, (self.n_local_heads, self.head_dim))
+            q = triton_q_rms(q, self.eps)
+
         kv = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             kv, True)  # [N, head_dim]
         if self.compress_ratio > 1:
@@ -1694,6 +1701,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     hidden_states, True))  # [N, dim]
         else:
             full_hidden_states = hidden_states
+        main_stream.wait_stream(aux_stream)
 
         # Tail: q_rope + kv_rope + scatter (serial)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
