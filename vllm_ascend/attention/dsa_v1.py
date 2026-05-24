@@ -1684,11 +1684,11 @@ class AscendDSAImpl(DSAAttentionImpl):
         main_stream.wait_stream(aux_stream)
 
         # Part3: allgather(kv) + allgather(hidden_states) || wq_b + q_rms
-        q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
         e_part3 = main_stream.record_event()
 
         with npu_stream_switch(aux_stream, enabled=True):
             torch.npu.current_stream().wait_event(e_part3)
+            q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
             q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(
                 -1, (self.n_local_heads, self.head_dim))
             q = triton_q_rms(q, self.eps)
