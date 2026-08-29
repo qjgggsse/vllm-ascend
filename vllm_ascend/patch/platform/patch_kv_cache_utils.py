@@ -17,7 +17,18 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.utils import vllm_version_is
+
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+TURBOQUANT_CACHE_DTYPE = "turboquant_4bit_nc"
+
+
+def _is_dsa_tq4_spec(spec: KVCacheSpec) -> bool:
+    return (
+        getattr(spec, "cache_dtype_str", None) == TURBOQUANT_CACHE_DTYPE
+        and getattr(spec, "model_version", None) == "deepseek_v4"
+        and getattr(spec, "sparse_head_dim", None) is None
+    )
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -101,6 +112,11 @@ def _get_kv_cache_groups_uniform_groups(
     # containing only MLAAttentionSpec.
     full_mla_spec = grouped_specs[0]
     full_mla_c128_spec = grouped_specs[1]
+    uses_dsa_tq4 = any(
+        _is_dsa_tq4_spec(spec)
+        for group in grouped_specs
+        for spec in group.kv_cache_specs.values()
+    )
 
     assert all(isinstance(spec, MLAAttentionSpec) for spec in full_mla_spec.kv_cache_specs.values())
     full_mla_group = KVCacheGroupSpec(
@@ -134,20 +150,22 @@ def _get_kv_cache_groups_uniform_groups(
 
     # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
     # Possibly padding layer tuples for this.
-    # Additionally, we also pad KV blocks in each SWA layer, to align the page size
-    # with the corresponding layer in the full-MLA group.
+    # TQ4 shrinks the c4 page below some compressor-state pages. Only that
+    # layout may retain an oversized page; standard DeepSeek V4 keeps the
+    # existing page-padding contract unchanged.
     all_page_sizes = full_mla_spec.get_page_sizes()
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
-
+        if not uses_dsa_tq4:
+            assert max(sm_page_sizes) <= max(all_page_sizes)
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.
         size_to_candidate: dict[int, int] = {}
         for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+            candidates = [x for x in all_page_sizes if x >= ps]
+            size_to_candidate[ps] = min(candidates) if candidates else ps
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes

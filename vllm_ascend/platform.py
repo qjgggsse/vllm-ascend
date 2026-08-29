@@ -428,7 +428,18 @@ class NPUPlatform(Platform):
         # initialize ascend config from vllm additional_config
         cls._fix_incompatible_config(vllm_config)
 
+        if vllm_config.cache_config.cache_dtype == "turboquant_4bit_nc":
+            if vllm_config.additional_config is None:
+                vllm_config.additional_config = {}
+            vllm_config.additional_config["enable_tq_latent"] = True
+
         ascend_config = init_ascend_config(vllm_config)
+
+        if ascend_config.enable_dsa_tq_latent and vllm_config.parallel_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                "DeepSeek V4 TurboQuant KV cache does not support vLLM DCP. "
+                "Use DSA-CP through additional_config.enable_dsa_cp instead."
+            )
 
         from vllm_ascend.logger import configure_ascend_file_logging
         from vllm_ascend.logger import configure_ascend_logging
@@ -457,7 +468,10 @@ class NPUPlatform(Platform):
 
         ascend_config.update_compile_ranges_split_points()
 
-        if model_config and hasattr(model_config.hf_text_config, "index_topk"):
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        if hf_text_config is not None and (
+            hasattr(hf_text_config, "index_topk") or ascend_config.enable_dsa_tq_latent
+        ):
             vllm_config.cache_config.cache_dtype = str(model_config.dtype).replace("torch.", "")
 
         ascend_fusion_config = ascend_config.ascend_fusion_config

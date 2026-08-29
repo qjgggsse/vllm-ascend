@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def _is_deepseek_v4_dsa_model(model_config: Any) -> bool:
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    return hf_text_config is not None and getattr(hf_text_config, "model_type", None) == "deepseek_v4"
+
+
 class AscendConfig:
     """
     Configuration Object for additional_config from vllm.configs.
@@ -239,6 +244,9 @@ class AscendConfig:
                 )
 
         self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
+        tq_latent_requested = bool(additional_config.get("enable_tq_latent", False))
+        self.enable_tq_latent = tq_latent_requested and use_sparse
+        self.enable_dsa_tq_latent = tq_latent_requested and _is_deepseek_v4_dsa_model(vllm_config.model_config)
         self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
         quant_config = getattr(vllm_config, "quant_config", None)
         self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
