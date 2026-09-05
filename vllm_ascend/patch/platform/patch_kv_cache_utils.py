@@ -5,7 +5,9 @@ from collections import defaultdict
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -17,9 +19,13 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.core.kv_cache_interface import AscendPackedKVCacheTensor
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_max_concurrency_for_kv_cache_config = (
+    vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config
+)
+logger = init_logger(__name__)
 TURBOQUANT_CACHE_DTYPE = "turboquant_4bit_nc"
 
 
@@ -29,6 +35,64 @@ def _is_dsa_tq4_spec(spec: KVCacheSpec) -> bool:
         and getattr(spec, "model_version", None) == "deepseek_v4"
         and getattr(spec, "sparse_head_dim", None) is None
     )
+
+
+def _groups_use_dsa_tq4(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        specs = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+        )
+        if any(_is_dsa_tq4_spec(layer_spec) for layer_spec in specs):
+            return True
+    return False
+
+
+def _get_page_stride_alignment(spec: KVCacheSpec) -> int:
+    alignment = get_dtype_size(spec.dtype)
+    scale_dim = getattr(spec, "scale_dim", 0)
+    if scale_dim:
+        alignment = math.lcm(alignment, get_dtype_size(spec.scale_dtype))
+    if _is_dsa_tq4_spec(spec):
+        num_rows = spec.block_size * spec.num_kv_heads
+        if spec.page_size_bytes % num_rows:
+            raise ValueError(
+                "TQ4 KV page size must contain an integral number of packed rows, "
+                f"got page_size={spec.page_size_bytes} and num_rows={num_rows}."
+            )
+        alignment = math.lcm(alignment, spec.page_size_bytes // num_rows)
+    return alignment
+
+
+def _get_packed_page_payload_size(spec: KVCacheSpec) -> int:
+    # Compressor-state pages may be padded only for sharing with another
+    # bucket. TQ packing supplies the physical stride itself, so reserve only
+    # bytes actually used by the state view.
+    if (
+        isinstance(spec, SlidingWindowMLASpec)
+        and spec.page_size_padded is not None
+        and getattr(spec, "alignment", None) is None
+    ):
+        return spec.real_page_size_bytes
+    return spec.page_size_bytes
+
+
+def _ascend_get_max_concurrency_for_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+) -> float:
+    if not _groups_use_dsa_tq4(kv_cache_config.kv_cache_groups):
+        return _orig_get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        )
+
+    blocks_per_request = sum(
+        group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+        for group in kv_cache_config.kv_cache_groups
+    )
+    return kv_cache_config.num_blocks / blocks_per_request
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -217,23 +281,12 @@ def _get_kv_cache_config_deepseek_v4(
     per (tuple_idx, bucket) whose shared_by is the union of per-group
     layers at that slot.
     """
+    if _groups_use_dsa_tq4(kv_cache_groups):
+        return _get_tq4_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
+
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
     page_sizes = sorted(full_mla_spec.get_page_sizes())
-    if any(
-        _is_dsa_tq4_spec(spec)
-        for group in kv_cache_groups
-        for spec in group.kv_cache_spec.kv_cache_specs.values()
-    ):
-        # TQ4 may leave compressor-state pages larger than full-MLA pages.
-        page_sizes = sorted(
-            set(page_sizes).union(
-                spec.page_size_bytes
-                for group in kv_cache_groups
-                for name, spec in group.kv_cache_spec.kv_cache_specs.items()
-                if "mtp" not in name
-            )
-        )
     layer_tuple_page_bytes = sum(page_sizes)
 
     # Pre-bucket each group's layers by page_size (registration order within
@@ -277,7 +330,128 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _pack_group_layers(
+    layer_names: list[str],
+    specs: dict[str, KVCacheSpec],
+    physical_page_size: int,
+) -> list[dict[str, int]]:
+    slots: list[dict[str, int]] = []
+    slot_sizes: list[int] = []
+    ordered_names = sorted(
+        enumerate(layer_names),
+        key=lambda item: (-_get_packed_page_payload_size(specs[item[1]]), item[0]),
+    )
+    for _, name in ordered_names:
+        page_size = _get_packed_page_payload_size(specs[name])
+        page_alignment = _get_page_stride_alignment(specs[name])
+        if page_size > physical_page_size:
+            raise ValueError(
+                f"KV page for {name} ({page_size} bytes) exceeds physical "
+                f"page size ({physical_page_size} bytes)."
+            )
+        for slot_idx, used_bytes in enumerate(slot_sizes):
+            offset = round_up(used_bytes, page_alignment)
+            if offset + page_size <= physical_page_size:
+                slots[slot_idx][name] = offset
+                slot_sizes[slot_idx] = offset + page_size
+                break
+        else:
+            slots.append({name: 0})
+            slot_sizes.append(page_size)
+    return slots
+
+
+def _get_tq4_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """Pack TQ4 logical pages into physical pages shared by block tables."""
+    group_slots: list[list[dict[str, int]]] = []
+    mtp_layers: list[tuple[str, int]] = []
+    main_specs = {
+        name: spec
+        for group in kv_cache_groups
+        for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+        if "mtp" not in name
+    }
+    if not main_specs:
+        raise ValueError("DeepSeek V4 TQ4 KV layout requires main-model cache specs.")
+
+    physical_page_alignment = math.lcm(
+        *(_get_page_stride_alignment(spec) for spec in main_specs.values())
+    )
+    packing_page_size = round_up(
+        max(_get_packed_page_payload_size(spec) for spec in main_specs.values()),
+        physical_page_alignment,
+    )
+
+    for group in kv_cache_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        main_layers = []
+        for name in group.layer_names:
+            if "mtp" in name:
+                mtp_layers.append((name, specs[name].page_size_bytes))
+            else:
+                main_layers.append(name)
+        group_slots.append(_pack_group_layers(main_layers, specs, packing_page_size))
+
+    num_physical_slots = max(map(len, group_slots))
+    physical_page_sizes = []
+    for slot_idx in range(num_physical_slots):
+        required_size = 0
+        required_alignment = 1
+        for slots in group_slots:
+            if slot_idx >= len(slots):
+                continue
+            for name, offset in slots[slot_idx].items():
+                spec = main_specs[name]
+                required_size = max(
+                    required_size,
+                    offset + _get_packed_page_payload_size(spec),
+                )
+                required_alignment = math.lcm(
+                    required_alignment, _get_page_stride_alignment(spec)
+                )
+        physical_page_sizes.append(round_up(required_size, required_alignment))
+
+    bytes_per_block = sum(physical_page_sizes) + sum(
+        page_size for _, page_size in mtp_layers
+    )
+    num_blocks = may_override_num_blocks(vllm_config, available_memory // bytes_per_block)
+    logger.info_once(
+        "DeepSeek V4 KV cache layout: mode=tq4, bytes_per_block=%d, num_blocks=%d, "
+        "physical_page_sizes=%s",
+        bytes_per_block,
+        num_blocks,
+        tuple(physical_page_sizes),
+        scope="local",
+    )
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for slot_idx, physical_page_size in enumerate(physical_page_sizes):
+        layer_offsets: dict[str, int] = {}
+        for slots in group_slots:
+            if slot_idx < len(slots):
+                layer_offsets.update(slots[slot_idx])
+        kv_cache_tensors.append(
+            AscendPackedKVCacheTensor(
+                size=physical_page_size * num_blocks,
+                shared_by=list(layer_offsets),
+                physical_page_size=physical_page_size,
+                layer_offsets=layer_offsets,
+            )
+        )
+    for name, page_size in mtp_layers:
+        kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=[name]))
+    return num_blocks, kv_cache_tensors
+
+
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config = (
+    _ascend_get_max_concurrency_for_kv_cache_config
+)
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 # vLLM v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and
