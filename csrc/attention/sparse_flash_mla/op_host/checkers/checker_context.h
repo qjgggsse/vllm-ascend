@@ -13,8 +13,10 @@
 
 #include <cstdint>
 #include <vector>
+#include "log/log.h"
 #include "tiling/tiling_api.h"
 #include "exe_graph/runtime/tiling_context.h"
+#include "platform/platform_info.h"
 
 namespace optiling {
 namespace sparse_mla_checker {
@@ -40,6 +42,7 @@ struct TensorParam {
 struct CheckContext {
     const char *opName = nullptr;
     OperatorVariant variant = OperatorVariant::SPARSE;
+    NpuArch npuArch = NpuArch::DAV_2201;
 
     TensorParam q;
     TensorParam oriKv;
@@ -83,7 +86,7 @@ struct CheckContext {
     int64_t quantMode = 0;
     int64_t ropeHeadDim = 0;
     float softmaxScale = 1.0F;
-    int64_t cmpRatio = 0;
+    int64_t cmpRatio = 1;
     int64_t oriMaskMode = 0;
     int64_t cmpMaskMode = 0;
     int64_t oriWinLeft = -1;

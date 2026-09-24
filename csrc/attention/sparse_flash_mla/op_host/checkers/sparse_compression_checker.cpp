@@ -13,8 +13,19 @@
 
 namespace optiling {
 namespace sparse_mla_checker {
+constexpr int64_t TURBO_QUANT_MODE = 3;
 namespace {
-const char *Op(const CheckContext &context) { return context.opName == nullptr ? "SparseMla" : context.opName; }
+const char *Op(const CheckContext &context)
+{
+    return context.opName == nullptr ? "SparseMla" : context.opName;
+}
+
+bool IsTurboQuantEmptyTndIndex(const CheckContext &context, const TensorParam &param, const char *name)
+{
+    return context.variant == OperatorVariant::MIXED_QUANT && context.quantMode == TURBO_QUANT_MODE &&
+           context.qLayout == Layout::TND && std::string(name) == "cmp_sparse_indices" && param.shape != nullptr &&
+           param.shape->GetDimNum() > 0 && param.shape->GetDim(0) == 0;
+}
 } // namespace
 
 ge::graphStatus SparseCompressionChecker::CheckIndex(const CheckContext &context, const TensorParam &param,
@@ -26,7 +37,8 @@ ge::graphStatus SparseCompressionChecker::CheckIndex(const CheckContext &context
     const size_t dimNum = context.qLayout == Layout::BSND ? 4U : 3U;
     if (CheckTensorDesc(context, param, name, {ge::DT_INT32}) != ge::GRAPH_SUCCESS ||
         CheckDimNum(context, param, name, {dimNum}) != ge::GRAPH_SUCCESS ||
-        CheckNoEmptyDim(context, param, name) != ge::GRAPH_SUCCESS) {
+        (!IsTurboQuantEmptyTndIndex(context, param, name) &&
+         CheckNoEmptyDim(context, param, name) != ge::GRAPH_SUCCESS)) {
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;
@@ -49,11 +61,13 @@ ge::graphStatus SparseCompressionChecker::CheckTopkLength(const CheckContext &co
 
 ge::graphStatus SparseCompressionChecker::CheckSinglePara(const CheckContext &context) const
 {
+    // Ascend callers use 0 for the uncompressed SWA-only SparseFlashMla path.
+    const bool legacySwa = context.variant == OperatorVariant::SPARSE && !context.cmpKv.present &&
+                           context.cmpRatio == 0;
     OP_CHECK_IF(
-        context.cmpRatio < 0 || context.cmpRatio > 128 || (context.cmpKv.present && context.cmpRatio == 0),
+        !legacySwa && (context.cmpRatio < 1 || context.cmpRatio > 128),
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(Op(context), "cmp_ratio", std::to_string(context.cmpRatio).c_str(),
-                                              "Cmp_ratio must be 0 or 1 when cmp_kv is absent, or in range [1, 128] "
-                                              "when cmp_kv is present"),
+                                              "Cmp_ratio must be in range [1, 128]"),
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(
         context.topkValueMode != 1,
@@ -70,6 +84,19 @@ ge::graphStatus SparseCompressionChecker::CheckSinglePara(const CheckContext &co
 
 ge::graphStatus SparseCompressionChecker::CheckParaExistence(const CheckContext &context) const
 {
+    if (context.variant == OperatorVariant::MIXED_QUANT && context.quantMode == TURBO_QUANT_MODE) {
+        OP_CHECK_IF(!context.cmpKv.present || !context.cmpSparseIndices.present,
+                    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(Op(context), "cmp_kv/cmp_sparse_indices",
+                                                             "TurboQuant requires both inputs"),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(context.oriSparseIndices.present || context.cmpResidualKv.present ||
+                        context.oriTopkLength.present || context.cmpTopkLength.present,
+                    OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                        Op(context), "unsupported TurboQuant inputs",
+                        "ori_sparse_indices, cmp_residual_kv and topk length inputs must be absent"),
+                    return ge::GRAPH_FAILED);
+        return ge::GRAPH_SUCCESS;
+    }
     if (!context.cmpKv.present) {
         OP_CHECK_IF(context.cmpSparseIndices.present,
                     OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(Op(context), "cmp_sparse_indices",
@@ -96,9 +123,9 @@ ge::graphStatus SparseCompressionChecker::CheckParaExistence(const CheckContext 
             OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(Op(context), "seqused_cmp_kv", "Seqused_cmp_kv requires cmp_kv"),
             return ge::GRAPH_FAILED);
         OP_CHECK_IF(
-            context.cmpRatio != 0 && context.cmpRatio != 1,
+            context.cmpRatio != 1 && !(context.variant == OperatorVariant::SPARSE && context.cmpRatio == 0),
             OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(Op(context), "cmp_ratio", std::to_string(context.cmpRatio).c_str(),
-                                                  "Cmp_ratio must be 0 or 1 when cmp_kv is absent"),
+                                                  "Cmp_ratio must be 1 (or 0 for SparseFlashMla SWA) when cmp_kv is absent"),
             return ge::GRAPH_FAILED);
     }
 
@@ -107,6 +134,13 @@ ge::graphStatus SparseCompressionChecker::CheckParaExistence(const CheckContext 
                 OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
                     Op(context), "cmp_residual_kv",
                     "Cmp_residual_kv is required when cmp_mask_mode is 3 and cmp_ratio is not 1"),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context.cmpResidualKv.present && (context.cmpMaskMode == 0 || context.cmpRatio == 1),
+                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
+                    Op(context), "cmp_residual_kv",
+                    std::string("Cmp_residual_kv is not supported when cmp_mask_mode is 0 or cmp_ratio is 1, "
+                                "but got cmp_mask_mode=") +
+                        std::to_string(context.cmpMaskMode) + ", cmp_ratio=" + std::to_string(context.cmpRatio)),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(context.oriSparseIndices.present && context.oriMaskMode == 0 && !context.oriTopkLength.present,
                 OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
