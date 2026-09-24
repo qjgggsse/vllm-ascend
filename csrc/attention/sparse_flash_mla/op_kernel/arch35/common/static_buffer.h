@@ -27,15 +27,15 @@ using namespace AscendC;
 
 namespace fa_base_matmul {
 
-template <typename ElemType>
+template <typename ElemT>
 struct StaticBuffer {
-    LocalTensor<ElemType> tensor;
+    LocalTensor<ElemT> tensor;
     uint32_t idx;
 };
 
-template <typename ElemType>
+template <typename ElemT>
 struct RingBuffer {
-    StaticBuffer<ElemType> *bufs;
+    StaticBuffer<ElemT> *bufs;
     uint32_t bufNum;
     uint32_t curId;
 
@@ -44,13 +44,13 @@ struct RingBuffer {
           bufNum(0),
           curId(0)
     {}
-    __aicore__ inline RingBuffer(StaticBuffer<ElemType> *b, uint32_t n)
+    __aicore__ inline RingBuffer(StaticBuffer<ElemT> *b, uint32_t n)
         : bufs(b),
           bufNum(n),
           curId(n - 1)
     {}
 
-    __aicore__ inline StaticBuffer<ElemType> &GetNext()
+    __aicore__ inline StaticBuffer<ElemT> &GetNext()
     {
         curId = (curId + 1) % bufNum;
         return bufs[curId];
