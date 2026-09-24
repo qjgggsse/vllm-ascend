@@ -236,26 +236,28 @@ class AuroraTilingKeysTest(unittest.TestCase):
                     expected.add((0, 1, 2, mode, split_g, head_ratio_one, batch_consistency, vectorize))
             with self.subTest(arch=arch):
                 selected = self.matrices["sparse_flash_mla", arch]
-                self.assertEqual(set(selected), expected)
-                self.assertEqual(len(selected), 6 if arch == 220 else 12)
+                # The verbatim Sparse MLA package includes the full matrix;
+                # every previously selected model key must remain available.
+                self.assertTrue(expected <= set(selected))
                 self.assertEqual(len(selected), len(set(selected)))
 
-    def test_sparse_mla_architectures_exclude_each_others_specializations(self):
-        a2a3 = set(self.matrices["sparse_flash_mla", 220])
-        a5 = set(self.matrices["sparse_flash_mla", 310])
-        self.assertTrue(all(key[4] == 0 and key[7] == 0 for key in a2a3))
-        self.assertTrue(all(key[5] == 0 for key in a5))
-        self.assertEqual(len(a2a3 & a5), 4)
-        host = self.matrices["sparse_flash_mla", None]
-        self.assertEqual(set(host), a2a3 | a5)
-        self.assertEqual(len(host), 14)
-
-    def test_sparse_mla_scope_and_a2a3_qli_quantization(self):
+    def test_sparse_mla_full_matrix_matches_host_and_both_architectures(self):
+        expected = {
+            (0, q_layout, kv_layout, mode, split_g, head_ratio_one, deterministic, vectorize)
+            for q_layout, kv_layout in ((0, 0), (0, 2), (1, 1), (1, 2))
+            for mode, split_g, head_ratio_one, deterministic, vectorize in itertools.product(
+                range(5), (0, 1), (0, 1), (0, 1), (0, 1)
+            )
+        }
         for arch in (None, 220, 310):
             with self.subTest(arch=arch):
-                for key in self.matrices["sparse_flash_mla", arch]:
-                    self.assertEqual(key[1:3], (1, 2))  # TND / PA_BBND
-                    self.assertIn(key[3], (0, 2))  # SWA / CSA
+                selected = self.matrices["sparse_flash_mla", arch]
+                self.assertEqual(set(selected), expected)
+                self.assertEqual(len(selected), 320)
+
+    def test_a2a3_qli_quantization(self):
+        for arch in (None, 220, 310):
+            with self.subTest(arch=arch):
                 if arch != 310:
                     # A2/A3: INT8 Q/K, INT32 output, paged attention, TND / PA_BBND.
                     self.assertEqual(

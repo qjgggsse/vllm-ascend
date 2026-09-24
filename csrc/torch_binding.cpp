@@ -41,7 +41,7 @@
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
-#include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
+#include "aclnn_torch_adapter/sparse_flash_mla_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
