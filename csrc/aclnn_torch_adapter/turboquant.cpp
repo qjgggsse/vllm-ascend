@@ -15,6 +15,119 @@
 #include <torch/extension.h>
 #include "op_api_common.h"
 
+namespace op_api {
+
+// npu tensor max size
+const int SIZE = 8;
+const int DIM_0 = 0;
+const int DIM_1 = 1;
+const int DIM_2 = 2;
+const int DIM_3 = 3;
+const int DIM_4 = 4;
+
+std::tuple<at::Tensor, at::Tensor> ConstructMixedQuantSparseFlashMlaAttenOutTensor(
+    const at::Tensor &q, const at::Tensor &oriKv, std::string layoutQStr, std::string layoutKvStr,
+    const uint64_t &ropeHeadDim, bool returnSoftmaxLse, int64_t quantMode)
+{
+    TORCH_CHECK(layoutQStr == "BSND" || layoutQStr == "TND", "The layout of query only support BSND and TND, but got ",
+                layoutQStr);
+    for (auto i = 0; i < q.sizes().size(); i++) {
+        const bool turboQuantEmptyQuery = quantMode == 3 && layoutQStr == "TND" && i == DIM_0 && q.size(i) == 0;
+        TORCH_CHECK(q.size(i) > 0 || turboQuantEmptyQuery,
+                    "All values within query's shape should be greater "
+                    "than 0, but shape[",
+                    i, "] is ", q.size(i));
+    }
+    at::SmallVector<int64_t, SIZE> attenOutSize;
+    at::SmallVector<int64_t, SIZE> softmaxLseSize;
+    if (layoutQStr == "BSND") {
+        TORCH_CHECK(q.dim() == DIM_4, "When the layout of query is BSND, the query dimension must be 4, but got ",
+                    q.dim());
+        // atten_out_size = {q.size(DIM_0), q.size(DIM_1), q.size(DIM_2), q.size(DIM_3) - rope_head_dim};
+        attenOutSize = {q.size(DIM_0), q.size(DIM_1), q.size(DIM_2), q.size(DIM_3)};
+    } else {
+        TORCH_CHECK(q.dim() == DIM_3, "When the layout of query is TND, the query dimension must be 3, but got ",
+                    q.dim());
+        // atten_out_size = {q.size(DIM_0), q.size(DIM_1), q.size(DIM_2) - rope_head_dim};
+        attenOutSize = {q.size(DIM_0), q.size(DIM_1), q.size(DIM_2)};
+    }
+    at::Tensor attenOut = at::empty(attenOutSize, q.options().dtype(q.dtype()));
+
+    if (returnSoftmaxLse) {
+        TORCH_CHECK(oriKv.size(DIM_1) > 0, "oriKv.size(DIM_1) must be greater than 0, but got ", oriKv.size(DIM_1));
+        TORCH_CHECK(oriKv.size(DIM_2) > 0, "oriKv.size(DIM_2) must be greater than 0, but got ", oriKv.size(DIM_2));
+        if (layoutQStr == "BSND") {
+            int64_t dim0 = static_cast<int64_t>(q.size(DIM_0));
+            int64_t dim1 = static_cast<int64_t>(oriKv.size(DIM_2));
+            int64_t dim2 = static_cast<int64_t>(q.size(DIM_1));
+            int64_t dim3 = static_cast<int64_t>(q.size(DIM_2)) / static_cast<int64_t>(oriKv.size(DIM_2));
+            softmaxLseSize = {dim0, dim1, dim2, dim3};
+        } else {
+            if (layoutKvStr == "PA_BBND") {
+                int64_t dim0 = static_cast<int64_t>(oriKv.size(DIM_2));
+                int64_t dim1 = static_cast<int64_t>(q.size(DIM_0));
+                int64_t dim2 = static_cast<int64_t>(q.size(DIM_1)) / static_cast<int64_t>(oriKv.size(DIM_2));
+                softmaxLseSize = {dim0, dim1, dim2};
+            } else {
+                int64_t dim0 = static_cast<int64_t>(oriKv.size(DIM_1));
+                int64_t dim1 = static_cast<int64_t>(q.size(DIM_0));
+                int64_t dim2 = static_cast<int64_t>(q.size(DIM_1)) / static_cast<int64_t>(oriKv.size(DIM_1));
+                softmaxLseSize = {dim0, dim1, dim2};
+            }
+        }
+    } else {
+        // 不返回时tensor传空
+        softmaxLseSize = {0};
+    }
+    at::Tensor softmaxLse = at::empty(softmaxLseSize, q.options().dtype(torch::kFloat32));
+
+    return std::tuple<at::Tensor, at::Tensor>(attenOut, softmaxLse);
+}
+
+std::tuple<at::Tensor, at::Tensor> MixedQuantSparseFlashMla(
+    const at::Tensor &q, const c10::optional<at::Tensor> &oriKv, const c10::optional<at::Tensor> &cmpKv,
+    const c10::optional<at::Tensor> &oriSparseIndices, const c10::optional<at::Tensor> &cmpSparseIndices,
+    const c10::optional<at::Tensor> &oriBlockTable, const c10::optional<at::Tensor> &cmpBlockTable,
+    const c10::optional<at::Tensor> &cuSeqlensQ, const c10::optional<at::Tensor> &cuSeqlensOriKv,
+    const c10::optional<at::Tensor> &cuSeqlensCmpKv, const c10::optional<at::Tensor> &sequsedQ,
+    const c10::optional<at::Tensor> &sequsedOriKv, const c10::optional<at::Tensor> &sequsedCmpKv,
+    const c10::optional<at::Tensor> &cmpResidualKv, const c10::optional<at::Tensor> &oriTopkLength,
+    const c10::optional<at::Tensor> &cmpTopkLength, const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, int64_t quantMode, int64_t ropeHeadDim, double softmaxScale,
+    int64_t cmpRatio, int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
+    c10::string_view layoutQ, c10::string_view layoutKv, int64_t topkValueMode, bool returnSoftmaxLse)
+{
+    std::string layoutQStr = std::string(layoutQ);
+    std::string layoutKvStr = std::string(layoutKv);
+    const bool turboQuantEmptyQuery = quantMode == 3 && layoutQStr == "TND" && q.dim() == DIM_3 && q.size(DIM_0) == 0;
+    TORCH_CHECK(q.numel() > 0 || turboQuantEmptyQuery, "Tensor query is empty.");
+    TORCH_CHECK(oriKv.has_value(), "ori_kv must be provided.");
+    const at::Tensor &oriKvVal = *oriKv;
+    // convert str
+    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
+    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+
+    // construct the atten_out tensor
+    std::tuple<at::Tensor, at::Tensor> mixedQuantSparseFlashMlaAttenOut =
+        op_api::ConstructMixedQuantSparseFlashMlaAttenOutTensor(q, oriKvVal, layoutQStr, layoutKvStr, ropeHeadDim,
+                                                                returnSoftmaxLse, quantMode);
+    at::Tensor attenOut = std::get<0>(mixedQuantSparseFlashMlaAttenOut);
+    at::Tensor softmaxLse = std::get<1>(mixedQuantSparseFlashMlaAttenOut);
+
+    at::Tensor nullTensor;
+    auto oriKvValue = oriKv.has_value() ? oriKv.value() : nullTensor;
+    auto cmpKvValue = cmpKv.has_value() ? cmpKv.value() : nullTensor;
+    if (q.is_meta()) return {attenOut, softmaxLse};
+    EXEC_NPU_CMD(aclnnMixedQuantSparseFlashMla, q, oriKvValue, cmpKvValue, oriSparseIndices, cmpSparseIndices,
+              oriBlockTable, cmpBlockTable, cuSeqlensQ, cuSeqlensOriKv, cuSeqlensCmpKv, sequsedQ, sequsedOriKv,
+              sequsedCmpKv, cmpResidualKv, oriTopkLength, cmpTopkLength, sinks, metadata, quantMode, ropeHeadDim,
+              softmaxScale, cmpRatio, oriMaskMode, cmpMaskMode, oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr,
+              topkValueMode, returnSoftmaxLse, attenOut, softmaxLse);
+    return std::tuple<at::Tensor, at::Tensor>(attenOut, softmaxLse);
+}
+
+} // namespace op_api
+
 namespace cann_ops_nn {
 namespace quant {
 
@@ -54,6 +167,39 @@ std::tuple<at::Tensor, at::Tensor> turbo_quant(const at::Tensor& latent, const a
 
 
 TORCH_LIBRARY_FRAGMENT(_C_ascend, m) {
+    m.def(R"schema(mixed_quant_sparse_flash_mla(Tensor q,
+        *,Tensor? ori_kv=None,
+        Tensor? cmp_kv=None,
+        Tensor? ori_sparse_indices=None,
+        Tensor? cmp_sparse_indices=None,
+        Tensor? ori_block_table=None,
+        Tensor? cmp_block_table=None,
+        Tensor? cu_seqlens_q=None,
+        Tensor? cu_seqlens_ori_kv=None,
+        Tensor? cu_seqlens_cmp_kv=None,
+        Tensor? seqused_q=None,
+        Tensor? seqused_ori_kv=None,
+        Tensor? seqused_cmp_kv=None,
+        Tensor? cmp_residual_kv=None,
+        Tensor? ori_topk_length=None,
+        Tensor? cmp_topk_length=None,
+        Tensor? sinks=None,
+        Tensor? metadata=None,
+        int quant_mode=3,
+        int rope_head_dim=64,
+        float softmax_scale=1.0,
+        int cmp_ratio=1,
+        int ori_mask_mode=0,
+        int cmp_mask_mode=0,
+        int ori_win_left=-1,
+        int ori_win_right=-1,
+        str layout_q="BSND",
+        str layout_kv="BSND",
+        int topk_value_mode=1,
+        bool return_softmax_lse=False) -> (Tensor,
+        Tensor))schema");
+    m.impl("mixed_quant_sparse_flash_mla", torch::kPrivateUse1, &op_api::MixedQuantSparseFlashMla);
+    m.impl("mixed_quant_sparse_flash_mla", torch::kMeta, &op_api::MixedQuantSparseFlashMla);
     m.def(R"schema(turbo_quant(Tensor latent, Tensor centroids) -> (Tensor, Tensor))schema");
     m.impl("turbo_quant", torch::kPrivateUse1, &cann_ops_nn::quant::turbo_quant);
     m.impl("turbo_quant", torch::kMeta, &cann_ops_nn::quant::turbo_quant);
