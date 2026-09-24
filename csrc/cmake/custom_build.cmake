@@ -294,6 +294,7 @@ else()
     # genop新增非experimental算子分类
     # add_subdirectory(${op_class})
     add_subdirectory(attention)
+    add_subdirectory(quant)
 endif()
 
 
