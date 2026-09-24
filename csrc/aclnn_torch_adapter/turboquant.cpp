@@ -15,6 +15,11 @@
 #include <torch/extension.h>
 #include "op_api_common.h"
 
+// Ascend dispatcher adapter; copied operator sources are kept unchanged.
+static at::Tensor get_valid_tensor(const c10::optional<at::Tensor>& x, at::Device device) {
+    return x.has_value() ? *x : at::empty({0}, at::TensorOptions().dtype(at::kInt).device(device));
+}
+
 namespace op_api {
 
 // npu tensor max size
@@ -24,6 +29,66 @@ const int DIM_1 = 1;
 const int DIM_2 = 2;
 const int DIM_3 = 3;
 const int DIM_4 = 4;
+
+constexpr int64_t MQSMLA_METADATA_SIZE = 1024;
+
+at::Tensor MixedQuantSparseFlashMlaMetadata(
+    int64_t numHeadsQ, int64_t numHeadsKv, int64_t headDim, int64_t quantMode,
+    const c10::optional<at::Tensor> &cuSeqlensQ, const c10::optional<at::Tensor> &cuSeqlensOriKv,
+    const c10::optional<at::Tensor> &cuSeqlensCmpKv, const c10::optional<at::Tensor> &sequsedQ,
+    const c10::optional<at::Tensor> &sequsedOriKv, const c10::optional<at::Tensor> &sequsedCmpKv,
+    const c10::optional<at::Tensor> &cmpResidualKv, const c10::optional<at::Tensor> &oriTopkLength,
+    const c10::optional<at::Tensor> &cmpTopkLength, int64_t batchSize, int64_t maxSeqlenQ, int64_t maxSeqlenOriKv,
+    int64_t maxSeqlenCmpKv, int64_t oriTopk, int64_t cmpTopk, int64_t ropeHeadDim, int64_t cmpRatio,
+    int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight, c10::string_view layoutQ,
+    c10::string_view layoutKv, bool hasOriKv, bool hasCmpKv)
+{
+    at::Device outputDevice = at::Device(std::string("npu"));
+    if (cuSeqlensQ.has_value()) {
+        outputDevice = cuSeqlensQ.value().device();
+    } else if (cuSeqlensOriKv.has_value()) {
+        outputDevice = cuSeqlensOriKv.value().device();
+    } else if (cuSeqlensCmpKv.has_value()) {
+        outputDevice = cuSeqlensCmpKv.value().device();
+    } else if (sequsedQ.has_value()) {
+        outputDevice = sequsedQ.value().device();
+    } else if (sequsedOriKv.has_value()) {
+        outputDevice = sequsedOriKv.value().device();
+    } else if (sequsedCmpKv.has_value()) {
+        outputDevice = sequsedCmpKv.value().device();
+    } else if (cmpResidualKv.has_value()) {
+        outputDevice = cmpResidualKv.value().device();
+    } else if (oriTopkLength.has_value()) {
+        outputDevice = oriTopkLength.value().device();
+    } else if (cmpTopkLength.has_value()) {
+        outputDevice = cmpTopkLength.value().device();
+    }
+
+    at::Tensor output = torch::empty({MQSMLA_METADATA_SIZE}, torch::dtype(torch::kInt32).device(outputDevice));
+    auto cuSeqlensQVal = get_valid_tensor(cuSeqlensQ, outputDevice);
+    auto cuSeqlensOriKvVal = get_valid_tensor(cuSeqlensOriKv, outputDevice);
+    auto cuSeqlensCmpKvVal = get_valid_tensor(cuSeqlensCmpKv, outputDevice);
+    auto sequsedQVal = get_valid_tensor(sequsedQ, outputDevice);
+    auto sequsedOriKvVal = get_valid_tensor(sequsedOriKv, outputDevice);
+    auto sequsedCmpKvVal = get_valid_tensor(sequsedCmpKv, outputDevice);
+    auto cmpResidualKvVal = get_valid_tensor(cmpResidualKv, outputDevice);
+    auto oriTopkLengthVal = get_valid_tensor(oriTopkLength, outputDevice);
+    auto cmpTopkLengthVal = get_valid_tensor(cmpTopkLength, outputDevice);
+
+    // convert str
+    std::string layoutQStr = std::string(layoutQ);
+    std::string layoutKvStr = std::string(layoutKv);
+    char *layoutQPtr = const_cast<char *>(layoutQStr.c_str());
+    char *layoutKvPtr = const_cast<char *>(layoutKvStr.c_str());
+
+    if (outputDevice.is_meta()) return output;
+    EXEC_NPU_CMD(aclnnMixedQuantSparseFlashMlaMetadata, cuSeqlensQVal, cuSeqlensOriKvVal, cuSeqlensCmpKvVal, sequsedQVal,
+              sequsedOriKvVal, sequsedCmpKvVal, cmpResidualKvVal, oriTopkLengthVal, cmpTopkLengthVal, numHeadsQ,
+              numHeadsKv, headDim, quantMode, batchSize, maxSeqlenQ, maxSeqlenOriKv, maxSeqlenCmpKv, oriTopk, cmpTopk,
+              ropeHeadDim, cmpRatio, oriMaskMode, cmpMaskMode, oriWinLeft, oriWinRight, layoutQPtr, layoutKvPtr,
+              hasOriKv, hasCmpKv, output);
+    return output;
+}
 
 std::tuple<at::Tensor, at::Tensor> ConstructMixedQuantSparseFlashMlaAttenOutTensor(
     const at::Tensor &q, const at::Tensor &oriKv, std::string layoutQStr, std::string layoutKvStr,
@@ -167,6 +232,30 @@ std::tuple<at::Tensor, at::Tensor> turbo_quant(const at::Tensor& latent, const a
 
 
 TORCH_LIBRARY_FRAGMENT(_C_ascend, m) {
+    m.def(R"schema(mixed_quant_sparse_flash_mla_metadata(int num_heads_q,
+        int num_heads_kv,
+        int head_dim,int quant_mode,
+        *,
+        Tensor? cu_seqlens_q=None,
+        Tensor? cu_seqlens_ori_kv=None,Tensor? cu_seqlens_cmp_kv=None,
+        Tensor? seqused_q=None,
+        Tensor? seqused_ori_kv=None,Tensor? seqused_cmp_kv=None,
+        Tensor? cmp_residual_kv=None,
+        Tensor? ori_topk_length=None,Tensor? cmp_topk_length=None,
+        int batch_size=0,
+        int max_seqlen_q=0,
+        int max_seqlen_ori_kv=0,int max_seqlen_cmp_kv=0,
+        int ori_topk=0,
+        int cmp_topk=0,
+        int rope_head_dim=64,int cmp_ratio=4,
+        int ori_mask_mode=0,
+        int cmp_mask_mode=0,
+        int ori_win_left=-1,int ori_win_right=-1,
+        str layout_q="TND",
+        str layout_kv="PA_BBND",
+        bool has_ori_kv=True,bool has_cmp_kv=True) -> Tensor)schema");
+    m.impl("mixed_quant_sparse_flash_mla_metadata", torch::kPrivateUse1, &op_api::MixedQuantSparseFlashMlaMetadata);
+    m.impl("mixed_quant_sparse_flash_mla_metadata", torch::kMeta, &op_api::MixedQuantSparseFlashMlaMetadata);
     m.def(R"schema(mixed_quant_sparse_flash_mla(Tensor q,
         *,Tensor? ori_kv=None,
         Tensor? cmp_kv=None,
