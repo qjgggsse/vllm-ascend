@@ -15,51 +15,10 @@
 #ifndef SPARSE_FLASH_MLA_TILING_H
 #define SPARSE_FLASH_MLA_TILING_H
 
-#include <exe_graph/runtime/tiling_context.h>
-#include <tiling/platform/platform_ascendc.h>
-#include "register/tilingdata_base.h"
-#include "tiling/tiling_api.h"
-#include "err/ops_err.h"
+#include "common/smla_host_common_defs.h"
 #include "platform/soc_spec.h"
 
 namespace optiling {
-// ------------------公共定义--------------------------
-struct SMLATilingRequiredParaInfo {
-    const gert::CompileTimeTensorDesc *desc;
-    const gert::StorageShape *shape;
-};
-
-struct SMLATilingOptionalParaInfo {
-    const gert::CompileTimeTensorDesc *desc;
-    const gert::Tensor *tensor;
-    const gert::StorageShape *shape;
-};
-
-enum class SMLALayout : uint32_t {
-    BSND = 0,
-    TND = 1,
-    PA_BBND = 2
-};
-
-enum class SMLAAxis : uint32_t {
-    B = 0,
-    S = 1,
-    N = 2,
-    D = 3,
-    K = 3, // sparse_indices的K和key的D枚举值相同，表达相同位置, 最后一维
-    T = 5,
-    Bn = 6, // block number
-    Bs = 7  // block size
-};
-
-enum class SMLATemplateMode : uint32_t {
-    SWA_TEMPLATE_MODE = 0,
-    HCA_TEMPLATE_MODE = 1,
-    CSA_TEMPLATE_MODE = 2,
-    ORI_SPARSE_TEMPLATE_MODE = 3,
-    ORI_CMP_SPARSE_TEMPLATE_MODE = 4
-};
-
 // ------------------算子原型索引常量定义----------------
 // Inputs Index (0-10, common)
 constexpr uint32_t Q_INDEX = 0;
@@ -80,9 +39,6 @@ constexpr uint32_t ORI_TOPK_LENGTH_INDEX = 14;
 constexpr uint32_t CMP_TOPK_LENGTH_INDEX = 15;
 constexpr uint32_t SINKS_INDEX = 16;
 constexpr uint32_t METADATA_INDEX = 17;
-// Outputs Index
-constexpr uint32_t ATTN_OUT_INDEX = 0;
-constexpr uint32_t SOFTMAX_LSE_INDEX = 1;
 
 // Attributes Index
 constexpr uint32_t ATTR_SOFTMAX_SCALE_INDEX = 0;
@@ -96,24 +52,13 @@ constexpr uint32_t ATTR_LAYOUT_KV_INDEX = 7;
 constexpr uint32_t ATTR_TOPK_VALUE_MODE_INDEX = 8; // A2/A3
 constexpr uint32_t ATTR_RETURN_SOFTMAX_LSE_INDEX = 9;
 
-// Dim Index
-constexpr uint32_t DIM_IDX_ONE = 1;
-constexpr uint32_t DIM_IDX_TWO = 2;
-constexpr uint32_t DIM_IDX_THREE = 3;
-constexpr uint32_t DIM_IDX_FOUR = 4;
-
-// Dim Num
-constexpr uint32_t DIM_NUM_ONE = 1;
-constexpr uint32_t DIM_NUM_TWO = 2;
-constexpr uint32_t DIM_NUM_THREE = 3;
-constexpr uint32_t DIM_NUM_FOUR = 4;
-
 // 常量
 constexpr uint32_t BYTE_BLOCK = 32;
 
 // 入参限制常量
 constexpr uint32_t METADATA_LIMIT = 1024;
 constexpr uint32_t DIM_LIMIT = 512;
+constexpr uint32_t TOPK_LIMIT = 8192;
 constexpr uint32_t BLOCK_SIZE_LIMIT = 1024;
 
 // -----------算子TilingData定义（A2/A3字段顺序 + A5追加字段）---------------
@@ -245,7 +190,7 @@ public:
     uint32_t cmpKeyStride0 = 0; // A5
 
     float softmaxScale = 0;
-    int64_t cmpRatio = 0;
+    int64_t cmpRatio = 1;
     uint64_t oriMaskMode = 0;
     uint64_t cmpMaskMode = 0;
     uint64_t oriKvStride0 = 0; // A2/A3
@@ -354,7 +299,7 @@ private:
     ge::graphStatus CheckFeatureDtype() const;
     ge::graphStatus CheckFeaturePa() const;
 
-    ge::graphStatus CheckMultiParaConsistency();
+    ge::graphStatus CheckMultiParaConsistency() const;
     ge::graphStatus CheckDTypeConsistency(const ge::DataType &actualDtype, const ge::DataType &expectDtype,
                                           const std::string &name) const;
     ge::graphStatus CheckOriAndCmpKv() const;
@@ -367,19 +312,19 @@ private:
     SMLAParaInfo opParamInfo_;
     const SMLATilingInfo &smlaInfo_;
 
-    uint32_t bSize_ = 0;
-    uint32_t n1Size_ = 0;
-    uint32_t n2Size_ = 0;
-    uint32_t gSize_ = 0;
-    uint32_t s1Size_ = 0;
+    int64_t bSize_ = 0;
+    int64_t n1Size_ = 0;
+    int64_t n2Size_ = 0;
+    int64_t gSize_ = 0;
+    int64_t s1Size_ = 0;
     int64_t s2Size_ = 0;
     int64_t cmpS2Size_ = 0; // A5
-    uint32_t qHeadDim_ = 0;
+    int64_t qHeadDim_ = 0;
     uint32_t oriKvHeadDim_ = 0;
     uint32_t cmpKvHeadDim_ = 0;
 
-    uint32_t qTSize_ = 0; // 仅TND时生效
-    int64_t cmpRatio_ = 0;
+    int64_t qTSize_ = 0; // 仅TND时生效
+    int64_t cmpRatio_ = 1;
     int64_t oriWinLeft_ = 0;
     int64_t oriWinRight_ = 0;
     bool hasOriSparseIndices_ = false;
@@ -393,8 +338,8 @@ private:
     SMLALayout outLayout_ = SMLALayout::TND;
     SMLALayout kvLayout_ = SMLALayout::PA_BBND;
 
-    int32_t oriBlockSize_ = 0;
-    int32_t cmpBlockSize_ = 0;
+    int64_t oriBlockSize_ = 0;
+    int64_t cmpBlockSize_ = 0;
 
     NpuArch npuArch_ = NpuArch::DAV_2201;
 
@@ -422,9 +367,9 @@ public:
     ge::graphStatus CheckRequiredParaExistence() const;
     ge::graphStatus CheckUnrequiredParaExistence() const;
 
-    ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor, SMLALayout &layout,
+    ge::graphStatus GetActualSeqLenSize(int64_t &size, const gert::Tensor *tensor, SMLALayout &layout,
                                         const std::string &name) const;
-    ge::graphStatus GetActualSeqLenQSize(uint32_t &size);
+    ge::graphStatus GetActualSeqLenQSize(int64_t &size);
     ge::graphStatus GetOpName();
     ge::graphStatus GetNpuInfo();
     void GetOptionalInputParaInfo();
@@ -437,7 +382,7 @@ public:
     ge::graphStatus GetQueryAndOutLayout();
     ge::graphStatus GetKvLayout();
     ge::graphStatus GetSMLATemplateMode();
-    void SetSMLAShape();
+    ge::graphStatus SetSMLAShape();
     ge::graphStatus GetN1Size();
     ge::graphStatus GetN2Size();
     ge::graphStatus GetGSize();
@@ -467,19 +412,19 @@ public:
 
     bool HasAxis(const SMLAAxis &axis, const SMLALayout &layout, const gert::Shape &shape) const;
     size_t GetAxisIdx(const SMLAAxis &axis, const SMLALayout &layout) const;
-    uint32_t GetAxisNum(const gert::Shape &shape, const SMLAAxis &axis, const SMLALayout &layout) const;
-    static constexpr uint32_t invalidDimValue_ = std::numeric_limits<uint32_t>::min();
+    int64_t GetAxisNum(const gert::Shape &shape, const SMLAAxis &axis, const SMLALayout &layout) const;
+    static constexpr int64_t invalidDimValue_ = std::numeric_limits<int64_t>::min();
 
     // BaseParams
-    uint32_t bSize_ = 0;
-    uint32_t n1Size_ = 0;
-    uint32_t n2Size_ = 0;
-    uint32_t gSize_ = 0;
-    uint32_t s1Size_ = 0;
+    int64_t bSize_ = 0;
+    int64_t n1Size_ = 0;
+    int64_t n2Size_ = 0;
+    int64_t gSize_ = 0;
+    int64_t s1Size_ = 0;
     int64_t s2Size_ = 0;
     int64_t cmpS2Size_ = 0; // A5
-    uint32_t qTSize_ = 0;
-    uint32_t qHeadDim_ = 0;
+    int64_t qTSize_ = 0;
+    int64_t qHeadDim_ = 0;
     uint32_t oriKvHeadDim_ = 0;
     uint32_t cmpKvHeadDim_ = 0;
     int64_t sparseBlockSize_ = 0;
@@ -512,8 +457,8 @@ public:
     // PageAttention
     uint32_t oriMaxBlockNumPerBatch_ = 0;
     uint32_t cmpMaxBlockNumPerBatch_ = 0;
-    int32_t oriBlockSize_ = 0;
-    int32_t cmpBlockSize_ = 0;
+    int64_t oriBlockSize_ = 0;
+    int64_t cmpBlockSize_ = 0;
 
     // template mode
     SMLATemplateMode perfMode_ = SMLATemplateMode::SWA_TEMPLATE_MODE;
