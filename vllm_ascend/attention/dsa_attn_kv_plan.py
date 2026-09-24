@@ -9,8 +9,13 @@ from typing import Any
 import torch
 import torch_npu
 
+from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
+    mixed_quant_sparse_flash_mla,
+    mixed_quant_sparse_flash_mla_metadata,
+)
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.quantization.turboquant import is_turboquant
 
 _BF16_KV_CACHE_DTYPES = frozenset({"bfloat16", "bf16"})
 
@@ -128,8 +133,22 @@ class DsaAttnKvPlan:
         )
 
 
-def get_dsa_attn_kv_plan(vllm_config) -> DsaAttnKvPlan:
-    """Return the explicit A5 BF16 or upstream-compatible FP8 DSA plan."""
+def get_dsa_attn_kv_plan(vllm_config, compress_ratio: int = 1) -> DsaAttnKvPlan:
+    """Select a cache plan by hardware, dtype and the layer compression ratio."""
+    if is_turboquant(vllm_config) and compress_ratio == 4:
+        return DsaAttnKvPlan(
+            uses_sparse_flash_mla=False,
+            uses_kv_compress_epilog=False,
+            layout_kv="PA_BBND",
+            compressor_slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET,
+            requires_block_offset_slots=True,
+            sparse_attn_op=mixed_quant_sparse_flash_mla,
+            sparse_attn_metadata_op=mixed_quant_sparse_flash_mla_metadata,
+            sparse_attn_base_kwargs={},
+            sparse_attn_metadata_kwargs={},
+            include_metadata_device=False,
+            applies_sparse_attn_runtime_kwargs=True,
+        )
     if not _supports_dsv4_compressed_cache():
         return DsaAttnKvPlan(
             uses_sparse_flash_mla=False,

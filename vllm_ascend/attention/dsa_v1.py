@@ -45,6 +45,8 @@ from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
+from vllm_ascend.quantization.turboquant import is_turboquant
+from vllm_ascend.quantization.turboquant.latent import TurboQuantLatent
 from vllm_ascend.utils import (
     get_potential_max_tokens,
     npu_stream_switch,
@@ -930,7 +932,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 if self.compressor_ratio == 4
                 else 128
             )
-            kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
+            kv_plan = get_dsa_attn_kv_plan(self.vllm_config, self.compressor_ratio)
             metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
             metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
             sas_metadata = metadata_op(
@@ -1516,6 +1518,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
     understand this class
     """
 
+    turboquant: TurboQuantLatent | None = None
+
     def __init__(
         self,
         n_heads: int,
@@ -1545,6 +1549,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         self.window_size = window_size
         self.q_lora_rank = q_lora_rank
         self.compress_ratio = compress_ratio
+        self.turboquant = TurboQuantLatent() if is_turboquant(self.vllm_config) and compress_ratio == 4 else None
         self.softmax_scale = self.head_dim**-0.5
         self.support_fp8_attention = get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
 
@@ -1575,6 +1580,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
+
+    def _write_kv_cache(self, cache, kv, slot_mapping):
+        if self.turboquant is not None:
+            if kv is None or kv.shape[0] == 0:
+                return
+            kv = self.turboquant.compress(kv) if cache.dtype == torch.uint8 else self.turboquant.forward(kv)
+            # A2/A3 ScatterNdUpdateSk dispatches packed bytes through INT8.
+            if cache.dtype == torch.uint8:
+                cache, kv = cache.view(torch.int8), kv.view(torch.int8)
+        get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(cache, kv, slot_mapping)
 
     def _get_layer_metadata(
         self,
@@ -1770,6 +1785,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         output_padded = output
+        if self.turboquant is not None:
+            self.turboquant._initialize(hidden_states.device)
         o_proj_input_shape = self._get_o_proj_input_shape(attn_metadata)
         if attn_metadata is None:
             # Profiling run: run o_proj on zero input so HCCL collectives are
@@ -1908,7 +1925,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             )
 
             # swa exec kv
-            get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
+            self._write_kv_cache(
                 swa_kv_cache,
                 kv,
                 slot_mapping,
@@ -2017,7 +2034,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
-            get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(swa_kv_cache, kv, slot_mapping)
+            self._write_kv_cache(swa_kv_cache, kv, slot_mapping)
 
         if is_prefill:
             q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -2095,7 +2112,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 compress_slot_mapping: torch.Tensor,
             ) -> None:
                 if compressed_kv.shape[0] > 0:
-                    get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
+                    self._write_kv_cache(
                         compress_kv_cache,
                         compressed_kv,
                         compress_slot_mapping,
@@ -2129,7 +2146,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 metadata=layer_metadata.compressor,
             )
         if compressed_kv.shape[0] > 0:
-            get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
+            self._write_kv_cache(
                 compress_kv_cache,
                 compressed_kv,
                 compress_slot_mapping,
@@ -2229,7 +2246,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         notify_kv_cache_written(layer_name)
         wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_metadata.sas_metadata))
-        kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
+        kv_plan = get_dsa_attn_kv_plan(self.vllm_config, self.compress_ratio)
         attn_op = kv_plan.get_dsa_sparse_attn_op()
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:
@@ -2273,5 +2290,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 assert compress_topk_idxs is not None
                 attn_kwargs["cmp_sparse_indices"] = compress_topk_idxs
 
+        if self.turboquant is not None:
+            q = self.turboquant.forward(q)
         with attention_transfer_window():
-            return attn_op(q, **attn_kwargs)[0]
+            result = attn_op(q, **attn_kwargs)[0]
+        return self.turboquant.inverse(result) if self.turboquant is not None else result

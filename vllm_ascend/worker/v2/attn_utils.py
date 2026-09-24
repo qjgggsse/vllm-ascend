@@ -62,6 +62,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.quantization.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import (
     calc_split_factor,
@@ -487,13 +488,20 @@ def _view_dsv4_cache(
     kv_cache_spec: AttentionSpec,
     attn_backend: AttentionBackend,
     kv_cache_config: KVCacheConfig,
+    page_stride: int | None = None,
 ) -> list[torch.Tensor]:
     """Create DSA cache views without applying normal MLA K/V splitting."""
-    if raw_tensor.numel() % kv_cache_spec.page_size_bytes:
-        raise ValueError("DSA cache allocation is not a whole number of physical pages.")
-    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-    if num_blocks != kv_cache_config.num_blocks:
-        raise ValueError(f"DSA cache has {num_blocks} blocks, expected {kv_cache_config.num_blocks}.")
+    if page_stride is None:
+        page_stride = kv_cache_spec.page_size_bytes
+    num_blocks = kv_cache_config.num_blocks
+    if page_stride == kv_cache_spec.page_size_bytes:
+        if raw_tensor.numel() % page_stride:
+            raise ValueError("DSA cache allocation is not a whole number of physical pages.")
+        if raw_tensor.numel() // page_stride != num_blocks:
+            raise ValueError(f"DSA cache has {raw_tensor.numel() // page_stride} blocks, expected {num_blocks}.")
+    required_bytes = (num_blocks - 1) * page_stride + kv_cache_spec.page_size_bytes
+    if raw_tensor.numel() < required_bytes:
+        raise ValueError("DSA cache view exceeds the backing allocation")
 
     k_shape = attn_backend.get_kv_cache_shape(
         num_blocks,
@@ -531,7 +539,7 @@ def _view_dsv4_cache(
         raw_tensor,
         cache_shapes,
         cache_dtypes,
-        kv_cache_spec.page_size_bytes,
+        page_stride,
         overlap_full_kv_cache,
     )
 
@@ -672,18 +680,21 @@ def _allocate_kv_cache(
         if len(tensor_sizes) != 1:
             raise ValueError("DeepSeek-V4 KV cache descriptors must share one backing allocation.")
         backing_size = tensor_sizes.pop()
+        uses_turboquant = uses_turboquant_groups(kv_cache_config.kv_cache_groups)
         dsv4_regions: list[tuple[str, int, int]] = []
         for descriptor in kv_cache_config.kv_cache_tensors:
             for layer_idx, layer_name in enumerate(get_kv_cache_tensor_layers(descriptor)):
                 spec = layer_kv_cache_spec[layer_name]
-                if descriptor.block_stride != spec.page_size_bytes:
+                if not uses_turboquant and descriptor.block_stride != spec.page_size_bytes:
                     raise ValueError(
                         "DeepSeek-V4 requires contiguous per-layer pages, "
                         f"but {layer_name} has block_stride="
                         f"{descriptor.block_stride} and page_size="
                         f"{spec.page_size_bytes}."
                     )
-                layer_size = kv_cache_config.num_blocks * spec.page_size_bytes
+                if descriptor.block_stride < spec.page_size_bytes:
+                    raise ValueError(f"DSA physical stride is smaller than the page for {layer_name}")
+                layer_size = (kv_cache_config.num_blocks - 1) * descriptor.block_stride + spec.page_size_bytes
                 start = descriptor.offset + layer_idx * descriptor.layer_stride
                 if start < 0 or start + layer_size > backing_size:
                     raise ValueError(
@@ -1002,6 +1013,16 @@ def _reshape_kv_cache_v2(
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
 
+    dsv4_page_strides = (
+        {
+            name: descriptor.block_stride
+            for descriptor in kv_cache_config.kv_cache_tensors
+            for name in get_kv_cache_tensor_layers(descriptor)
+        }
+        if is_dsv4_model and uses_turboquant_groups(kv_cache_config.kv_cache_groups)
+        else {}
+    )
+
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
@@ -1130,6 +1151,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec,
                     group.backend,
                     kv_cache_config,
+                    dsv4_page_strides.get(layer_name),
                 )
                 continue
 

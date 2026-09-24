@@ -58,6 +58,15 @@ def test_get_dsa_attn_kv_plan_requires_vllm_config():
         get_dsa_attn_kv_plan()
 
 
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8"])
+@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+def test_non_turboquant_plan_is_independent_of_compress_ratio(device_type, cache_dtype, compress_ratio):
+    with _on(device_type):
+        config = _cache_config(cache_dtype)
+        assert get_dsa_attn_kv_plan(config, compress_ratio) == get_dsa_attn_kv_plan(config)
+
+
 def test_a5_fp8_plan_uses_flat_shared_kv():
     with _on(AscendDeviceType.A5):
         plan = get_dsa_attn_kv_plan(_config(False))
