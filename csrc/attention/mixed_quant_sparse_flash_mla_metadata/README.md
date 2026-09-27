@@ -11,6 +11,8 @@
 |<term>Atlas推理系列产品</term>|      ×     |
 |<term>Atlas训练系列产品</term>|      ×     |
 
+> 适用范围：本文原有功能、函数原型、参数表、约束和示例保留 Ascend 950PR&950DT（A5）的量化基线说明，适用于quant_mode=1和quant_mode=2。Atlas A2/A3新增的quant_mode=3请参见“A2/A3 TurboQuant 补充说明”，其中的类型和布局扩展仅适用于quant_mode=3。
+
 ## 功能说明
 
 - 算子功能：`MixedQuantSparseFlashMlaMetadata`是`MixedQuantSparseFlashMla`算子的前置算子，用于后续Attention计算生成负载均衡的任务划分方案。本算子不执行实际的Attention计算，而是根据输入参数在AI CPU计算出每个AI Core应处理的Attention计算起止范围，从而最大化计算资源的利用率，避免各Core间负载不均衡的问题。
@@ -121,7 +123,7 @@
     <tr>
       <td>quant_mode</td>
       <td>属性</td>
-      <td>表示量化模式。1表示BF16 scale量化布局；2表示FLOAT8_E8M0 scale量化布局；3表示TurboQuant TQ4配套metadata。Metadata接口接受1、2、3，具体平台约束见约束说明。</td>
+      <td>表示量化模式，quant_mode=1表示K、V nope为per-token-group量化，scale类型为bfloat16，quant_mode=2表示K、V nope为per-token-group量化，scale类型为float8_e8m0。在Atlas A2/A3平台新增quant_mode=3表示TurboQuant TQ4配套metadata。</td>
       <td>INT32</td>
       <td>-</td>
     </tr>
@@ -247,12 +249,20 @@
   </tbody>
   </table>
 
+## A2/A3 TurboQuant 补充说明
+
+- Atlas A2、Atlas A3 支持 TurboQuant TQ4；A5 仍使用原有quant_mode=1和quant_mode=2。
+- 复用原有接口和量化模式参数，设置quant_mode=3启用。接口名、参数数量、顺序、声明类型、默认值、返回值和 ACLNN 两阶段调用形式均不变；新增的 Tensor 数据类型和布局仅在quant_mode=3下生效。
+- Metadata 接口通过原有 `quant_mode=3` 生成 A2/A3 TQ4 配套分核信息；本接口不执行 KV 量化或注意力计算。输出仍为 INT32、shape `(1024,)`。
+- 必须与主算子的量化模式、head 数、序列长度、布局、mask、压缩倍率和稀疏长度保持一致；主算子的必传项及quant_mode=3限制见[MixedQuantSparseFlashMla 说明](../mixed_quant_sparse_flash_mla/README.md)。
+- A5 quant_mode=1和quant_mode=2仍沿用上文完整的 per-token-group FP8、RoPE、scale 和 KV cache 布局定义；不使用quant_mode=3的258字节格式。
+
 ## 约束说明
 
 - `quant_mode`支持1、2、3，具体产品支持的量化模式如下。
 
 <!-- npu="950" id1 -->
-- <term>Ascend 950PR&950DT系列产品</term>：与`MixedQuantSparseFlashMla`算子配套使用时，仅支持`quant_mode=1/2`。
+- <term>Ascend 950PR&950DT系列产品</term>：与`MixedQuantSparseFlashMla`算子配套使用时，仅支持`quant_mode=1`或`quant_mode=2`。
 <!-- end id1 -->
 
 <!-- npu="A3" id2 -->

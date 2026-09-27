@@ -54,8 +54,6 @@ struct TempLoopInfo {
     uint64_t mBasicSizeTail = 0U; // gS1方向循环的尾基本块大小
     uint32_t cmpLoopTimes = 0;
     uint32_t oriLoopTimes = 0;
-    uint32_t v0OriSize = 0;
-    uint32_t v0CmpSize = 0;
 
     // sparsemode = 4
     int32_t oriMaskRight = 0;
@@ -596,8 +594,8 @@ __aicore__ inline void MixedQuantSparseFlashMlaTqCsaKernel<SAST>::CalcParams(uin
     } else {
         info.isOriOnly = false;
         info.relativeS2Idx = info.s2Idx - tempLoopInfo.oriLoopTimes;
-        uint64_t s2Offset = (info.s2Idx - tempLoopInfo.oriLoopTimes) * constInfo.s2BaseSize;
-        if (s2LoopIdx + 1 == tempLoopInfo.s2LoopTimes) {
+        uint64_t s2Offset = info.relativeS2Idx * constInfo.s2BaseSize;
+        if (info.relativeS2Idx + 1 == tempLoopInfo.cmpLoopTimes) {
             info.actualSingleProcessSInnerSize = tempLoopInfo.actCmpS2Size - s2Offset;
         } else {
             info.actualSingleProcessSInnerSize = constInfo.s2BaseSize;
@@ -612,11 +610,8 @@ __aicore__ inline void MixedQuantSparseFlashMlaTqCsaKernel<SAST>::CalcParams(uin
         info.v0S2Start = 0;
         info.v0S2DealSize = 0;
     } else {
-        info.v0S2Start = 0;
-        if (s2LoopIdx + 1 == tempLoopInfo.s2LoopTimes && s2LoopIdx == 2) { // tail
-            info.v0S2Start = 512;
-        }
-        info.v0S2DealSize = 512;
+        info.v0S2Start = info.relativeS2Idx * constInfo.s2BaseSize;
+        info.v0S2DealSize = constInfo.kvQuantMode == 3 ? info.actualSingleProcessSInnerSize : constInfo.s2BaseSize;
     }
 }
 
@@ -766,18 +761,10 @@ __aicore__ inline void MixedQuantSparseFlashMlaTqCsaKernel<SAST>::ProcessBalance
             }
 
             uint32_t s2SplitNum = oriSplitNum + cmpSplitNum;
-            constexpr uint32_t V0_SPLIT = 32; // align to 32
-            uint32_t v0OriSize = CeilDiv(oriS2Size * cmpS2Size, oriS2Size + cmpS2Size);
-            if (cmpS2Size > V0_SPLIT * oriSplitNum) {
-                v0OriSize = SASAlign(v0OriSize, V0_SPLIT * oriSplitNum);
-            }
-            uint32_t v0CmpSize = cmpS2Size - v0OriSize;
 
             tempLoopInfo.oriLoopTimes = oriSplitNum;
             tempLoopInfo.cmpLoopTimes = cmpSplitNum;
             tempLoopInfo.s2LoopTimes = s2SplitNum;
-            tempLoopInfo.v0OriSize = v0OriSize;
-            tempLoopInfo.v0CmpSize = v0CmpSize;
 
             uint32_t s2LoopEnd = (isEnd && constInfo.s2End != 0) ? constInfo.s2End : tempLoopInfo.s2LoopTimes;
             tempLoopInfo.s2LoopTimes = s2LoopEnd;

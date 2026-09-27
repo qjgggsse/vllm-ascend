@@ -498,6 +498,9 @@ __aicore__ inline void MixedQuantSparseFlashMlaCsa<CubeBlockType, VecBlockType>:
             SyncAll<false>();
         }
     }
+    if ASCEND_IS_AIV {
+        vecBlock.InitSinks(this->constInfo);
+    }
     FdRunInfo fdRunInfo;
     if ASCEND_IS_AIV {
         ParseFdRunInfo(fdRunInfo);
@@ -607,11 +610,6 @@ __aicore__ inline void MixedQuantSparseFlashMlaCsa<CubeBlockType, VecBlockType>:
                 if (mqsmlaS1NoNeedCalc || mqsmlaS2NoNeedCalc) {
                     continue;
                 }
-                if constexpr (!IS_BATCH_CONSISTENCY) {
-                    if (runParam.isCrossCoreSplit) {
-                        runParam.s2SplitIdx = s2SplitIdxCounter++;
-                    }
-                }
                 if constexpr (IS_SPLIT_G) {
                     mqsmlaMaxS2LoopCnt -= runParam.s2LoopEndIdx;
                 }
@@ -620,17 +618,17 @@ __aicore__ inline void MixedQuantSparseFlashMlaCsa<CubeBlockType, VecBlockType>:
                 s2LoopLimit = 0;
             }
             for (int64_t s2LoopCount = 0; s2LoopCount <= s2LoopLimit; ++s2LoopCount) {
+                int64_t safeBaseBlockNum =
+                    runParam.baseBlockNumPerReductionBlock > 0 ? runParam.baseBlockNumPerReductionBlock : 1LL;
+                int64_t reductionLoopCount = s2LoopCount;
                 if constexpr (IS_BATCH_CONSISTENCY) {
-                    int64_t safeBaseBlockNum =
-                        runParam.baseBlockNumPerReductionBlock > 0 ? runParam.baseBlockNumPerReductionBlock : 1LL;
-                    int64_t reductionLoopCount = s2LoopCount;
                     if (s2LoopCount >= runParam.oriKvLoopEndIdx) {
                         reductionLoopCount +=
                             (safeBaseBlockNum - runParam.oriKvLoopEndIdx % safeBaseBlockNum) % safeBaseBlockNum;
                     }
-                    if (runParam.isCrossCoreSplit && reductionLoopCount % safeBaseBlockNum == 0) {
-                        runParam.s2SplitIdx = s2SplitIdxCounter++;
-                    }
+                }
+                if (runParam.isCrossCoreSplit && reductionLoopCount % safeBaseBlockNum == 0) {
+                    runParam.s2SplitIdx = s2SplitIdxCounter++;
                 }
                 if (mqsmlaNotLastThreeLoop) {
                     RunInfo<HIGH_PERF> &runInfo1 = runInfo[taskId % 4];
