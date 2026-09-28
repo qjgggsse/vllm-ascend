@@ -23,11 +23,13 @@
 - <term>Atlas训练系列产品</term>：不支持
 <!-- end id6 -->
 
-> 适用范围：本文原有功能、函数原型、参数表、约束和示例保留 Ascend 950PR&950DT（A5）的量化基线说明，适用于quantMode=1和quantMode=2。Atlas A2/A3新增的quantMode=3请参见“A2/A3 TurboQuant 补充说明”，其中的类型和布局扩展仅适用于该模式。
-
 ## 功能说明
 
 - 算子功能：`aclnnMixedQuantSparseFlashMlaMetadata`是`aclnnMixedQuantSparseFlashMla`算子的前置算子，用于后续Attention计算生成负载均衡的任务划分方案。本算子不执行实际的Attention计算，而是根据输入参数在AI CPU计算出每个AI Core应处理的Attention计算起止范围，从而最大化计算资源的利用率，避免各Core间负载不均衡的问题。
+
+  <term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>支持TurboQuant TQ4。本接口通过原有量化模式参数`quantMode=3`生成配套分核信息，不执行KV量化或Attention计算，输出仍为INT32、shape为`(1024,)`。接口名、参数数量、顺序、声明类型、默认值、返回值和aclnn两段式调用形式保持不变。
+
+  <term>Ascend 950PR&950DT系列产品</term>使用原有的`quantMode=1`和`quantMode=2`量化模式。
 
   **该算子不建议单独使用，建议与aclnnMixedQuantSparseFlashMla算子配合使用，形成完整的工作流。**
     1. 接受aclnnMixedQuantSparseFlashMla算子接口输入数据shape信息，包含batchSize、qSeqlen、kSeqlen、mask。通过对输入分块并模拟计算耗时，均匀分配分块到可用核上，以降低aclnnMixedQuantSparseFlashMla算子的整体计算耗时，并提高硬件利用率。
@@ -232,7 +234,7 @@ aclnnStatus aclnnMixedQuantSparseFlashMlaMetadata(
       <td>quantMode（int64_t）</td>
       <td>输入</td>
       <td>表示量化模式。</td>
-      <td><ul><li>quantMode=1：Q: nope+rope: 非量化; KV: nope: per-token-group FP8_e4m3。groupSize=64; rope: non-quantized and consistent with q; scale: bf16; kvCacheLayout: blockSize*(rope[64*2]+nope[448]+scale[448/64*2]+pad[18])</li><li>quantMode=2：Q: nope+rope: 非量化; KV: nope: per-token-group FP8_e4m3。groupSize=64; rope: non-quantized and consistent with q; scale: e8m0; kvCacheLayout: blockSize*(nope+rope)+blockSize*(scale+pad[1])</li><li>Atlas A2/A3平台新增quantMode=3：TurboQuant TQ4配套metadata。</li></ul></td>
+      <td>表示量化模式，支持1、2、3，必须与主算子的quantMode一致。quantMode=1表示KV nope采用per-token-group量化、scale类型为BFLOAT16；quantMode=2表示KV nope采用per-token-group量化、scale类型为FLOAT8_E8M0；quantMode=3表示生成TurboQuant TQ4配套分核信息。本接口不执行KV量化或注意力计算；各模式的KV数据类型和存储布局详见<a href="../../mixed_quant_sparse_flash_mla/docs/aclnnMixedQuantSparseFlashMla.md#quantMode">quantMode描述</a>。</td>
       <td>-</td>
       <td>-</td>
       <td>-</td>
@@ -511,14 +513,6 @@ aclnnStatus aclnnMixedQuantSparseFlashMlaMetadata(
 
     返回aclnnStatus状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
 
-## A2/A3 TurboQuant 补充说明
-
-- Atlas A2、Atlas A3 支持 TurboQuant TQ4；A5 仍使用原有quantMode=1和quantMode=2。
-- 复用原有接口和量化模式参数，设置quantMode=3启用。接口名、参数数量、顺序、声明类型、默认值、返回值和 ACLNN 两阶段调用形式均不变；新增的 Tensor 数据类型和布局仅在quantMode=3下生效。
-- Metadata 接口通过原有 `quantMode=3` 生成 A2/A3 TQ4 配套分核信息；本接口不执行 KV 量化或注意力计算。输出仍为 INT32、shape `(1024,)`。
-- 必须与主算子的量化模式、head 数、序列长度、布局、mask、压缩倍率和稀疏长度保持一致；主算子的必传项及quantMode=3限制见[MixedQuantSparseFlashMla 说明](../../mixed_quant_sparse_flash_mla/docs/aclnnMixedQuantSparseFlashMla.md)。
-- A5 quantMode=1和quantMode=2仍沿用上文完整的 per-token-group FP8、RoPE、scale 和 KV cache 布局定义；不使用quantMode=3的258字节格式。
-
 ## 约束说明
 
   - `quantMode`支持1、2、3，具体产品支持的量化模式如下。
@@ -534,6 +528,8 @@ aclnnStatus aclnnMixedQuantSparseFlashMlaMetadata(
 <!-- npu="910b" id9 -->
 - <term>Atlas A2系列产品</term>：与`aclnnMixedQuantSparseFlashMla`算子配套使用时，仅支持`quantMode=3`。
 <!-- end id9 -->
+  - 在<term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>的TurboQuant TQ4场景，必须显式设置`quantMode=3`。该模式新增的数据类型和布局不适用于其他量化模式。
+  - Metadata接口与主算子的量化模式、head数、序列长度、布局、mask、压缩倍率和稀疏长度必须保持一致；主算子的必传项及`quantMode=3`限制见[MixedQuantSparseFlashMla说明](../../mixed_quant_sparse_flash_mla/docs/aclnnMixedQuantSparseFlashMla.md)。各量化模式的KV数据类型和存储布局详见主算子的`quantMode`参数说明。
   - aclnnMixedQuantSparseFlashMlaMetadata默认确定性实现。
   - B（Batch）表示输入样本批量大小，q、oriKvOptional、cmpKvOptional为配套的aclnnMixedQuantSparseFlashMla算子的入参，S1表示layoutQOptional=BSND时，q shape中的S轴的大小，T1表示layoutQOptional=TND时，q shape中的T轴的大小，S2表示layoutKvOptional=BSND时，oriKvOptional shape中的S轴的大小，S3表示layoutKvOptional=BSND时，cmpKvOptional shape中的S轴的大小，N2表示oriKvOptional、cmpKvOptional shape中的N轴的大小。
   - 参数cuSeqlensQOptional、cuSeqlensOriKvOptional、cuSeqlensCmpKvOptional要求其值为当前Batch与前序Batch有效token数的累加值，第一个元素固定为0，后一个元素的值必须大于等于前一个元素的值。

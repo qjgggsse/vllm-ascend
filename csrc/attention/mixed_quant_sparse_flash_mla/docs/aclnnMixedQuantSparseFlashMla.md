@@ -21,8 +21,6 @@
 - <term>Atlas训练系列产品</term>：不支持
 <!-- end id6 -->
 
-> 适用范围：本文原有功能、函数原型、参数表、约束和示例保留 Ascend 950PR&950DT（A5）的量化基线说明，适用于quantMode=1和quantMode=2。Atlas A2/A3新增的quantMode=3请参见“A2/A3 TurboQuant 补充说明”，其中的类型和布局扩展仅适用于该模式。
-
 ## 功能说明
 
 - 接口功能：
@@ -31,6 +29,12 @@
   - **SWA（Sliding Window Attention）**：仅传入`oriKvOptional`，对原始KV做滑动窗口注意力。
   - **CSA（Compressed Sparse Attention）**：同时传入`oriKvOptional`、`cmpKvOptional`和`cmpSparseIndicesOptional`，对原始KV窗口和topK选择出的压缩KV共同做注意力。
   - **HCA（Heavily Compressed Attention）**：同时传入`oriKvOptional`和`cmpKvOptional`，对原始KV窗口和连续压缩KV段共同做注意力。
+
+  <term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>支持TurboQuant TQ4，通过原有量化模式参数`quantMode=3`启用，仅支持CSA路径。DeepSeek V4框架当前仅对C4压缩KV启用此能力。接口名、参数数量、顺序、声明类型、默认值、返回值和aclnn两段式调用形式保持不变。
+
+  <term>Ascend 950PR&950DT系列产品</term>使用原有的`quantMode=1`和`quantMode=2`量化模式。
+
+  TurboQuant TQ4的KV数据类型、存储布局及码本约定详见`quantMode`参数说明。相对512维BFLOAT16的1024字节，单个被量化token的有效载荷减少约74.8%（约3.97倍压缩）。整个KV cache的收益还需计入未量化部分、物理页步长和对齐开销，不能直接按此倍率估算。
 
   `aclnnMixedQuantSparseFlashMlaMetadata`是`aclnnMixedQuantSparseFlashMla`的分核信息，在主算子执行前生成。当前版本主算子必须传入该metadata。典型调用流程如下：
 
@@ -193,7 +197,7 @@ aclnnStatus aclnnMixedQuantSparseFlashMla(
       <td>oriKvOptional（aclTensor*）</td>
       <td>输入</td>
       <td>原始KV输入张量，Key与Value共享同一份数据。</td>
-      <td>SWA/CSA/HCA场景必须传入。量化KV布局由quantMode决定：quantMode=1时，依次由rope（64，bfloat16）、nope（448，FLOAT8_E4M3FN）、scale（7，bfloat16）、pad（18B）拼接而成；quantMode=2时，依次由nope（448，FLOAT8_E4M3FN）、rope（64，bfloat16）、scale（7，FLOAT8_E8M0）、pad（1B）拼接而成。当前仅支持1和2，quantMode=2仅支持layoutKvOptional为PA_BBND。各量化模式均支持使用UINT8、FLOAT8_E4M3FN作为单字节存储视图，底层字节内容保持不变。Atlas A2/A3平台新增quantMode=3时使用与q相同的数据类型、kvD=512。</td>
+      <td>必须传入。数据类型和KV存储布局详见quantMode描述。</td>
       <td>详见quantMode</td>
       <td>ND</td>
       <td>
@@ -210,7 +214,7 @@ aclnnStatus aclnnMixedQuantSparseFlashMla(
       <td>cmpKvOptional（aclTensor*）</td>
       <td>输入</td>
       <td>压缩KV输入张量，Key与Value共享同一份数据。</td>
-      <td>CSA/HCA场景必须传入，SWA场景不传入。量化KV布局由quantMode决定，同oriKvOptional；quantMode=1或quantMode=2时使用FLOAT8_E4M3FN（内部数据类型详见quantMode）；quantMode=3时使用UINT8 TQ4数据、kvD=258。</td>
+      <td>CSA/HCA场景必须传入，SWA场景不传入。数据类型和KV存储布局详见quantMode描述。</td>
       <td>详见quantMode</td>
       <td>ND</td>
       <td>
@@ -396,10 +400,10 @@ aclnnStatus aclnnMixedQuantSparseFlashMla(
       <td>√</td>
     </tr>
     <tr>
-      <td>quantMode（int64_t）</td>
+      <td id="quantMode">quantMode（int64_t）</td>
       <td>输入</td>
       <td>表示量化模式。</td>
-      <td>表示量化模式。quantMode=1表示K、V nope为per-token-group量化，scale类型为bfloat16，quantMode=2表示K、V nope为per-token-group量化，scale类型为FLOAT8_E8M0。当前仅支持1和2，quantMode=2仅支持layoutKvOptional为PA_BBND。Atlas A2/A3平台新增quantMode=3表示融合TQ4反量化的TurboQuant路径。</td>
+      <td>表示量化模式，支持1、2、3，Q不量化。<ul><li>quantMode=1：q使用BFLOAT16，oriKvOptional和cmpKvOptional的nope采用per-token-group量化，groupSize=64。每个token依次由rope（64个BFLOAT16）、nope（448个FLOAT8_E4M3FN）、scale（7个BFLOAT16）、pad（18字节）拼接，kvD=608。</li><li>quantMode=2：q使用BFLOAT16，oriKvOptional和cmpKvOptional的nope采用per-token-group量化，groupSize=64。每个token包含nope（448个FLOAT8_E4M3FN）、rope（64个BFLOAT16）、scale（7个FLOAT8_E8M0）、pad（1字节），kvD=584；仅支持layoutKvOptional为PA_BBND，块内按blockSize*(nope+rope)+blockSize*(scale+pad)组织。</li><li>quantMode=1或quantMode=2时，oriKvOptional和cmpKvOptional支持使用UINT8或FLOAT8_E4M3FN作为单字节存储视图，底层字节内容保持不变；各字段的实际类型如上所述。</li><li>quantMode=3：表示融合TQ4反量化的TurboQuant路径，仅支持CSA场景。q使用FLOAT16或BFLOAT16；oriKvOptional保持非量化，数据类型与q一致，kvD=512；cmpKvOptional使用UINT8存储TQ4数据，每个token的512维数据编码为256字节的4位码本索引，再拼接2字节FLOAT16逐token scale，共258字节，kvD=258。两路KV均使用PA_BBND布局，shape分别为(blockNum, blockSize, 1, 512)和(blockNum, blockSize, 1, 258)。码本与TurboQuant量化端约定一致，不新增外部码本或scale参数。</li></ul></td>
       <td>-</td>
       <td>-</td>
       <td>-</td>
@@ -663,32 +667,6 @@ aclnnStatus aclnnMixedQuantSparseFlashMla(
 
   返回aclnnStatus状态码，具体参见[aclnn返回码](../../../docs/zh/context/aclnn_return_code.md)。
 
-## A2/A3 TurboQuant 补充说明
-
-- Atlas A2、Atlas A3 支持 TurboQuant TQ4；A5 仍使用原有quantMode=1和quantMode=2。
-- 复用原有接口和量化模式参数，设置quantMode=3启用。接口名、参数数量、顺序、声明类型、默认值、返回值和 ACLNN 两阶段调用形式均不变；新增的 Tensor 数据类型和布局仅在quantMode=3下生效。
-- 主算子只支持 CSA 路径，原始 KV 保持非量化，压缩 KV 使用 TQ4，反量化融合在注意力计算内部。DeepSeek V4 框架当前仅对 C4 压缩 KV 启用此能力。
-- 每个压缩 KV token 的512维数据编码为256字节的4位码本索引，再拼接2字节 FP16 逐 token scale，共258字节。码本与 TurboQuant 量化端约定一致，不新增外部码本或 scale 参数。该格式不是 A5 的 FP8 KV 布局。
-- 相对512维 BF16 的1024字节，单个被量化 token 的有效载荷减少约74.8%（约3.97倍压缩）。整个 KV cache 的收益需另外计入未量化部分、物理页步长和对齐开销，不能直接按此倍率估算。
-
-quantMode=3的参数约束如下；以下字段均为原有参数，不增加新的位置参数。
-
-| 参数 | A2/A3 quantMode=3约束 |
-| --- | --- |
-| `quantMode` | 3 |
-| `q`、`attnOut` | FLOAT16 或 BFLOAT16，类型和 shape 一致；TND 布局，shape `(qT, qN, 512)`；`qN` 为4到128的4的倍数，`qT` 允许为0 |
-| `oriKvOptional` | 必传；与 q 类型一致；PA_BBND 布局，shape `(blockNum, blockSize, 1, 512)` |
-| `cmpKvOptional` | 必传；UINT8；PA_BBND 布局，shape `(blockNum, blockSize, 1, 258)`；每行256字节索引及2字节 FP16 scale |
-| `layoutQOptional`、`layoutKvOptional` | 分别为 TND、PA_BBND；两路 KV 的 blockSize 均为16到1024的16的倍数，0轴 stride 必须覆盖一个完整物理块 |
-| `cmpSparseIndicesOptional` | 必传 INT32，shape `(qT, 1, 512)` 或 `(qT, 1, 1024)`；无效位置填 -1 |
-| `oriBlockTableOptional`、`cmpBlockTableOptional`、`cuSeqlensQOptional`、`sequsedOriKvOptional` | 均必传，沿用原有 INT32 类型和参数含义 |
-| `oriSparseIndicesOptional`、`oriTopkLengthOptional`、`cmpTopkLengthOptional`、`cuSeqlensOriKvOptional`、`cuSeqlensCmpKvOptional`、`sequsedQOptional`、`sequsedCmpKvOptional`、`cmpResidualKvOptional` | 不支持传入，保留原有可选参数位置 |
-| `oriMaskMode`、`cmpMaskMode`、`oriWinLeft`、`oriWinRight` | 分别为4、3、非负值、0 |
-| `cmpRatio`、`ropeHeadDim`、`topkValueMode` | 分别支持4或128、64、1；算子的压缩倍率支持范围不代表框架会量化全部压缩 KV |
-| `metadataOptional` | 必传，由前置 Metadata 接口以相同quantMode=3及相同输入属性生成，INT32、shape `(1024,)` |
-
-Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的布局、dtype 和空查询特例不会放宽 A5 quantMode=1和quantMode=2的校验条件。
-
 ## 约束说明
 
 - 确定性计算
@@ -699,7 +677,7 @@ Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的�
 
   - 参数cuSeqlensQOptional、cuSeqlensOriKvOptional、cuSeqlensCmpKvOptional、sequsedQOptional、sequsedOriKvOptional、sequsedCmpKvOptional、cmpResidualKvOptional、oriBlockTableOptional、cmpBlockTableOptional等输入属于tensor。由于算子在Tiling阶段无法获取tensor的具体数值，tiling侧不对值进行校验，正确性需要用户自行保证。若上述参数传入非法值，会触发未定义行为（精度问题、非法内存访问导致的程序崩溃等）。
   - aclnnMixedQuantSparseFlashMlaMetadata和aclnnMixedQuantSparseFlashMla的入参在调用时应该保持一致。由于算子分为两个接口分段调用，算子无法自行校验，正确性需要由用户自行保证。若接口传入参数不一致，会发生未定义行为（精度问题、非法内存访问导致的程序崩溃等）。
-  - oriTopkLengthOptional、cmpTopkLengthOptional表示ori/cmp sparseIndices实际参与计算的长度。其值不能大于sparseIndicesOptional的最后一维大小，且当sequsedQOptional传入时，topkLength对应有效部分的值需要大于等于0。
+  - oriTopkLengthOptional、cmpTopkLengthOptional表示ori/cmp sparseIndices实际参与计算的长度。当其值大于sparseIndicesOptional的最后一维大小时，超出部分按该大小截断；且当sequsedQOptional传入时，topkLength对应有效部分的值需要大于等于0。调用aclnnMixedQuantSparseFlashMlaMetadata和aclnnMixedQuantSparseFlashMla时，对应sparseIndicesOptional的最后一维大小需要保持一致。
   - 当oriMaskMode/cmpMaskMode为0时，oriKvK/cmpKvK需要大于等于oriTopkLengthOptional/cmpTopkLengthOptional的最大值。
   - cmpResidualKvOptional配合cmpRatio使用，可恢复压缩前KV长度。且每个batch的值需要小于cmpRatio。仅当cmpMaskMode为3且cmpRatio不等于1时允许传入；cmpMaskMode为0或cmpRatio等于1时不允许传入。
   - attnOut：tensor类型，公式中的输出，数据类型支持BFLOAT16。数据格式支持ND。限制：该输出参数的shape与入参q的shape保持一致，dtype与q一致。
@@ -712,7 +690,7 @@ Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的�
 
 <!-- npu="950" id7 -->
 - <term>Ascend 950PR&950DT系列产品</term>：
-  - 仅支持`quantMode=1`或`quantMode=2`。q、attnOut的数据类型为BFLOAT16，oriKvOptional、cmpKvOptional的数据类型为FLOAT8_E4M3FN。
+  - 仅支持`quantMode=1`或`quantMode=2`。数据类型和KV存储布局详见quantMode描述。
   - 下文参数组约束适用于`quantMode=1`或`quantMode=2`场景。
 <!-- end id7 -->
 
@@ -720,7 +698,7 @@ Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的�
 - <term>Atlas A3系列产品</term>：
   - 仅支持`quantMode=3`的TurboQuant路径。
   - q、attnOut：`layoutQOptional`为TND；数据类型为FLOAT16或BFLOAT16且保持一致；qN为4到128的4的倍数，qD为512，qT允许为0。
-  - oriKvOptional、cmpKvOptional：均必须传入，`layoutKvOptional`为PA_BBND。oriKvOptional的数据类型与q一致且kvD为512；cmpKvOptional的数据类型为UINT8且kvD为258。两者blockSize均为16到1024的16的倍数。
+  - oriKvOptional、cmpKvOptional：均必须传入，数据类型和KV存储布局详见quantMode描述。两者blockSize均为16到1024的16的倍数。
   - 稀疏与PA参数：cmpSparseIndicesOptional、oriBlockTableOptional、cmpBlockTableOptional必须传入；cmpSparseIndicesOptional的shape为(qT, 1, 512)或(qT, 1, 1024)。oriSparseIndicesOptional、oriTopkLengthOptional、cmpTopkLengthOptional不支持传入。
   - 序列参数：cuSeqlensQOptional、sequsedOriKvOptional必须传入；cuSeqlensOriKvOptional、cuSeqlensCmpKvOptional、sequsedQOptional、sequsedCmpKvOptional不支持传入。
   - Mask与压缩参数：`oriMaskMode=4`、`cmpMaskMode=3`、`oriWinLeft>=0`、`oriWinRight=0`，`cmpRatio`仅支持4或128；cmpResidualKvOptional不支持传入。
@@ -730,11 +708,33 @@ Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的�
 - <term>Atlas A2系列产品</term>：
   - 仅支持`quantMode=3`的TurboQuant路径。
   - q、attnOut：`layoutQOptional`为TND；数据类型为FLOAT16或BFLOAT16且保持一致；qN为4到128的4的倍数，qD为512，qT允许为0。
-  - oriKvOptional、cmpKvOptional：均必须传入，`layoutKvOptional`为PA_BBND。oriKvOptional的数据类型与q一致且kvD为512；cmpKvOptional的数据类型为UINT8且kvD为258。两者blockSize均为16到1024的16的倍数。
+  - oriKvOptional、cmpKvOptional：均必须传入，数据类型和KV存储布局详见quantMode描述。两者blockSize均为16到1024的16的倍数。
   - 稀疏与PA参数：cmpSparseIndicesOptional、oriBlockTableOptional、cmpBlockTableOptional必须传入；cmpSparseIndicesOptional的shape为(qT, 1, 512)或(qT, 1, 1024)。oriSparseIndicesOptional、oriTopkLengthOptional、cmpTopkLengthOptional不支持传入。
   - 序列参数：cuSeqlensQOptional、sequsedOriKvOptional必须传入；cuSeqlensOriKvOptional、cuSeqlensCmpKvOptional、sequsedQOptional、sequsedCmpKvOptional不支持传入。
   - Mask与压缩参数：`oriMaskMode=4`、`cmpMaskMode=3`、`oriWinLeft>=0`、`oriWinRight=0`，`cmpRatio`仅支持4或128；cmpResidualKvOptional不支持传入。
 <!-- end id9 -->
+
+#### TurboQuant参数约束
+
+以下约束适用于<term>Atlas A2系列产品</term>、<term>Atlas A3系列产品</term>的`quantMode=3`场景。以下字段均为原有参数，不增加新的位置参数；新增的Tensor数据类型和布局仅在`quantMode=3`下生效。
+
+| 参数 | `quantMode=3`约束 |
+| --- | --- |
+| `quantMode` | 3 |
+| `q`、`attnOut` | FLOAT16或BFLOAT16，类型和shape一致；TND布局，shape为`(qT, qN, 512)`；`qN`为4到128的4的倍数，`qT`允许为0 |
+| `oriKvOptional` | 必传；数据类型、布局和shape详见`quantMode`描述 |
+| `cmpKvOptional` | 必传；数据类型、布局和shape详见`quantMode`描述 |
+| `layoutQOptional`、`layoutKvOptional` | 分别为TND、PA_BBND；两路KV的blockSize均为16到1024的16的倍数，0轴stride必须覆盖一个完整物理块 |
+| `cmpSparseIndicesOptional` | 必传INT32，shape为`(qT, 1, 512)`或`(qT, 1, 1024)`；无效位置填-1 |
+| `oriBlockTableOptional`、`cmpBlockTableOptional`、`cuSeqlensQOptional`、`sequsedOriKvOptional` | 均必传，沿用原有INT32类型和参数含义 |
+| `oriSparseIndicesOptional`、`oriTopkLengthOptional`、`cmpTopkLengthOptional`、`cuSeqlensOriKvOptional`、`cuSeqlensCmpKvOptional`、`sequsedQOptional`、`sequsedCmpKvOptional`、`cmpResidualKvOptional` | 不支持传入，保留原有可选参数位置 |
+| `oriMaskMode`、`cmpMaskMode`、`oriWinLeft`、`oriWinRight` | 分别为4、3、非负值、0 |
+| `cmpRatio`、`ropeHeadDim`、`topkValueMode` | 分别支持4或128、64、1；算子的压缩倍率支持范围不代表框架会量化全部压缩KV |
+| `metadataOptional` | 必传，由前置Metadata接口以相同`quantMode=3`及相同输入属性生成，INT32、shape为`(1024,)` |
+
+`sinksOptional`和Softmax LSE继续使用原有参数及返回形式。
+
+<term>Ascend 950PR&950DT系列产品</term>的`quantMode=1`和`quantMode=2`参数校验条件保持不变。
 
 ### 特性参数组
 
@@ -814,7 +814,7 @@ Sinks 和 Softmax LSE 继续使用原有参数及返回形式。quantMode=3的�
                 <li>oriKvS > 0</li>
                 <li>cmpKvS > 0</li>
                 <li>kvN = 1</li>
-                <li>quantMode=1时kvD=608，quantMode=2时kvD=584</li>
+                <li>kvD详见quantMode描述</li>
                 <li>oriKvT > 0</li>
                 <li>cmpKvT > 0</li>
                 <li>oriKvBlockNums > 0</li>
