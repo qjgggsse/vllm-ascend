@@ -470,6 +470,7 @@ __aicore__ inline void KvQuantSparseFlashMlaCsaBlockVector<SAST>::ElewiseCompute
     uint32_t dealRowCount, uint32_t columnCount)
 {
     Muls(mmResUb, mmResUb, static_cast<T>(tilingData->tqBaseParams.softmaxScale), dealRowCount * columnCount);
+    PipeBarrier<PIPE_V>();
 
     // cmp_sparse_indices is capacity-sized and may be padded with -1.  The Cube
     // path still computes the capacity-sized tile, so mask the padded columns
@@ -499,7 +500,7 @@ __aicore__ inline void KvQuantSparseFlashMlaCsaBlockVector<SAST>::ElewiseCompute
                             static_cast<int64_t>(columnCount) - 1);
             }
         }
-    } else if (constInfo.sparseBlockCount > 0 && info.cmpS2IdLimit > 0) {
+    } else if (constInfo.kvQuantMode == 3 && constInfo.sparseBlockCount > 0 && info.cmpS2IdLimit > 0) {
         // TurboQuant tiles one query's gSize heads together, so every row in this block shares one top-k row.
         uint64_t topkRow = info.topKBaseOffset;
         int32_t probeCount = static_cast<int32_t>(constInfo.sparseBlockCount);
@@ -544,7 +545,8 @@ __aicore__ inline void KvQuantSparseFlashMlaCsaBlockVector<SAST>::SetInfInBlk(co
         for (int64_t bit = begin; bit <= finish; ++bit) {
             maskValue |= (1ULL << static_cast<uint64_t>(bit));
         }
-        uint64_t mask[1] = {maskValue};
+        // The bit-mask overload reads both words, including the unused FP32 high mask.
+        uint64_t mask[2] = {maskValue, 0};
         Duplicate(mmResUb[blockStart], SOFTMAX_MIN_NUM, mask, dealRowCount, 1, columnCount / BLOCK_ELEMENT_NUM);
     }
 }
