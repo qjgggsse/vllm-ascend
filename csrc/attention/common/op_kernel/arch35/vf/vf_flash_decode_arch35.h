@@ -18,7 +18,13 @@
 #include "kernel_tensor.h"
 
 constexpr float FLT_ZERO = 0;
+// The FA softmax maximum uses -FLT_MAX_NEW as the fully masked row sentinel.
 constexpr float FLT_MAX_NEW = 3.402823466e+38F;
+
+enum class SinkInjectStage : uint8_t {
+    AT_FA_PROLOGUE,
+    AT_FD_EPILOGUE,
+};
 
 namespace FaVectorApi {
 // bf16->fp32
@@ -199,8 +205,7 @@ __simd_vf__ void ComputeScaleValue_8_VF(__ubuf__ uint16_t *lseSink, __ubuf__ T *
         Reg::RegTensor<float> vregInfValue;
         Reg::MaskReg pregCompare;
         constexpr float infValue = 3e+99; // 3e+99 for float inf
-        constexpr uint32_t tmpMin = 0xFF167699;
-        float minValue = *((float *)&tmpMin);
+        constexpr float minValue = -FLT_MAX_NEW;
         Reg::Duplicate<float, float>(vregMinValue, minValue);
         Reg::Duplicate<float, float>(vregInfValue, infValue);
 
@@ -242,12 +247,13 @@ __aicore__ inline void ComputeScaleValue_8(const LocalTensor<SINK_T> &tmpSinkUb,
 }
 
 // //lseUb作为scale最终输出
-template <typename T, typename SINK_T>
+template <typename T, typename SINK_T, SinkInjectStage SINK_INJECT_STAGE = SinkInjectStage::AT_FD_EPILOGUE>
 __simd_vf__ void ComputeScaleValue_8_VF_FD(__ubuf__ T *lseSink, __ubuf__ T *lseMax, __ubuf__ T *lseMaxTmp,
                                            __ubuf__ T *lseSum, __ubuf__ T *lseSumTmp, __ubuf__ T *lseOutUb,
                                            __ubuf__ T *lseUb, __ubuf__ T *lseMaxReduce, uint32_t dealCount, uint16_t i,
                                            uint32_t dealRowCount, uint32_t actualCombineLoopSize,
-                                           uint16_t softmaxLseFlag, uint16_t learnableSinkFlag)
+                                           uint16_t softmaxLseFlag, uint16_t learnableSinkFlag,
+                                           float minCheckValue = FLT_MAX_NEW)
 {
     Reg::RegTensor<T> vregLseMax;
     Reg::RegTensor<T> vregLseMaxTmp;
@@ -281,11 +287,13 @@ __simd_vf__ void ComputeScaleValue_8_VF_FD(__ubuf__ T *lseSink, __ubuf__ T *lseM
                                                           pregTailN);
     }
 
-    for (i = 0; i < static_cast<uint16_t>(learnableSinkFlag); ++i) {
-        Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseSinkCast, (__ubuf__ float *&)lseSink);
-        Reg::Sub<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, vregLseMax, pregTailN);
-        Reg::Exp<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, pregTailN);
-        Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregLseSum, vregLseSum, vregLseSinkCast, pregTailN);
+    if constexpr (SINK_INJECT_STAGE == SinkInjectStage::AT_FD_EPILOGUE) {
+        for (i = 0; i < static_cast<uint16_t>(learnableSinkFlag); ++i) {
+            Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseSinkCast, (__ubuf__ float *&)lseSink);
+            Reg::Sub<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, vregLseMax, pregTailN);
+            Reg::Exp<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, pregTailN);
+            Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregLseSum, vregLseSum, vregLseSinkCast, pregTailN);
+        }
     }
 
     for (i = 0; i < static_cast<uint16_t>(softmaxLseFlag); ++i) {
@@ -293,10 +301,8 @@ __simd_vf__ void ComputeScaleValue_8_VF_FD(__ubuf__ T *lseSink, __ubuf__ T *lseM
         Reg::RegTensor<float> vregInfValue;
         Reg::MaskReg pregCompare;
         constexpr float infValue = 3e+99; // 3e+99 for float inf
-        constexpr uint32_t tmpMin = 0xFF167699;
-        float minValue = *((float *)&tmpMin);
         Reg::Duplicate<float, float>(vregInfValue, infValue);
-        Reg::Duplicate<float, float>(vregMinValue, minValue);
+        Reg::Duplicate<float, float>(vregMinValue, minCheckValue);
 
         Reg::Log<T, Reg::MaskMergeMode::ZEROING>(vregRes, vregLseSum, pregTailN);
         Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregRes, vregRes, vregLseMax, pregTailN);
@@ -315,12 +321,91 @@ __simd_vf__ void ComputeScaleValue_8_VF_FD(__ubuf__ T *lseSink, __ubuf__ T *lseM
     }
 }
 
-template <typename T, typename SINK_T>
+// minCheckValue 经 UB 传递的 FD 变体（与上方 ComputeScaleValue_8_VF_FD 逻辑一致）。
+// 背景：__simd_vf__ 函数携带过多标量参数时，末位运行时标量（原第 15 个参数 minCheckValue）在
+// AIV 首次调用会丢失（实测被污染为 0.0），与合法的 ln2 量化边界 max=0.0 行误判相等，导致 LSE 误输出
+// inf。调用方需预先将判值全向量广播写入 minCheckUb（参考 CalcMinCheckValueVF），此处直接向量加载。
+template <typename T, typename SINK_T, SinkInjectStage SINK_INJECT_STAGE = SinkInjectStage::AT_FD_EPILOGUE>
+__simd_vf__ void ComputeScaleValue_8_VF_FD_MinUb(__ubuf__ T *lseSink, __ubuf__ T *lseMaxTmp, __ubuf__ T *lseSumTmp,
+                                                 __ubuf__ T *lseOutUb, __ubuf__ T *lseUb, __ubuf__ T *lseMaxReduce,
+                                                 __ubuf__ float *minCheckUb, uint32_t dealCount, uint32_t dealRowCount,
+                                                 uint32_t actualCombineLoopSize, uint16_t softmaxLseFlag,
+                                                 uint16_t learnableSinkFlag)
+{
+    Reg::RegTensor<T> vregLseMax;
+    Reg::RegTensor<T> vregLseMaxTmp;
+    Reg::RegTensor<T> vregRes;
+    Reg::RegTensor<T> vregLseSum;
+    Reg::RegTensor<T> vregLseSumTmp;
+    Reg::RegTensor<T> vregLseSinkCast;
+    uint16_t blockStride = 0x1;
+    uint16_t repeatStride = dealRowCount;
+    uint32_t n = dealCount;
+    Reg::MaskReg pregTailN = Reg::UpdateMask<T>(n);
+    Reg::MaskReg pregSinkTailN = Reg::UpdateMask<SINK_T>(n);
+
+    Reg::Duplicate<T, Reg::MaskMergeMode::ZEROING, float>(vregLseSum, FLT_ZERO, pregTailN);
+    Reg::Duplicate<T, Reg::MaskMergeMode::ZEROING, float>(vregLseMax, -FLT_MAX_NEW, pregTailN);
+
+    for (uint16_t i = 0; i < static_cast<uint16_t>(actualCombineLoopSize); ++i) {
+        Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseMaxTmp, (__ubuf__ float *&)lseMaxTmp + i * dealCount);
+        Reg::Max<T, Reg::MaskMergeMode::ZEROING>(vregLseMax, vregLseMax, vregLseMaxTmp, pregTailN);
+    }
+    Reg::StoreAlign<T, StoreDist::DIST_NORM_B32>(lseMaxReduce, vregLseMax, pregTailN);
+
+    for (uint16_t i = 0; i < static_cast<uint16_t>(actualCombineLoopSize); ++i) {
+        Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseMaxTmp, (__ubuf__ float *&)lseMaxTmp + i * dealCount);
+        Reg::Sub<T, Reg::MaskMergeMode::ZEROING>(vregLseMaxTmp, vregLseMaxTmp, vregLseMax, pregTailN);
+        Reg::Exp<T, Reg::MaskMergeMode::ZEROING>(vregLseMaxTmp, vregLseMaxTmp, pregTailN);
+        Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseSumTmp, (__ubuf__ float *&)lseSumTmp + i * dealCount);
+        Reg::Mul<T, Reg::MaskMergeMode::ZEROING>(vregLseSumTmp, vregLseSumTmp, vregLseMaxTmp, pregTailN);
+        Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregLseSum, vregLseSum, vregLseSumTmp, pregTailN);
+        Reg::StoreAlign<T, Reg::StoreDist::DIST_NORM_B32>((__ubuf__ float *&)lseSumTmp + i * dealCount, vregLseSumTmp,
+                                                          pregTailN);
+    }
+
+    if constexpr (SINK_INJECT_STAGE == SinkInjectStage::AT_FD_EPILOGUE) {
+        for (uint16_t i = 0; i < learnableSinkFlag; ++i) {
+            Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseSinkCast, (__ubuf__ float *&)lseSink);
+            Reg::Sub<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, vregLseMax, pregTailN);
+            Reg::Exp<T, Reg::MaskMergeMode::ZEROING>(vregLseSinkCast, vregLseSinkCast, pregTailN);
+            Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregLseSum, vregLseSum, vregLseSinkCast, pregTailN);
+        }
+    }
+
+    for (uint16_t i = 0; i < static_cast<uint16_t>(softmaxLseFlag); ++i) {
+        Reg::RegTensor<float> vregMinValue;
+        Reg::RegTensor<float> vregInfValue;
+        Reg::MaskReg pregCompare;
+        constexpr float infValue = 3e+99; // 3e+99 for float inf
+        Reg::Duplicate<float, float>(vregInfValue, infValue);
+        // 判值从 UB 向量加载，规避 __simd_vf__ 末位运行时标量在 AIV 首次调用丢失的问题
+        Reg::LoadAlign<float, Reg::LoadDist::DIST_NORM>(vregMinValue, minCheckUb);
+
+        Reg::Log<T, Reg::MaskMergeMode::ZEROING>(vregRes, vregLseSum, pregTailN);
+        Reg::Add<T, Reg::MaskMergeMode::ZEROING>(vregRes, vregRes, vregLseMax, pregTailN);
+        // 如果 softmaxMax 等于负无穷，则将 lse 结果置为 inf
+        Reg::Compare<float, CMPMODE::EQ>(pregCompare, vregLseMax, vregMinValue, pregTailN);
+        Reg::Select<T>(vregRes, vregInfValue, vregRes, pregCompare);
+        Reg::StoreAlign<T, Reg::StoreDist::DIST_NORM_B32>(lseOutUb, vregRes, pregTailN);
+    }
+
+    Reg::LocalMemBar<Reg::MemType::VEC_STORE, Reg::MemType::VEC_LOAD>();
+    for (uint16_t i = 0; i < static_cast<uint16_t>(actualCombineLoopSize); ++i) {
+        Reg::LoadAlign<T, Reg::LoadDist::DIST_NORM>(vregLseSumTmp, (__ubuf__ float *&)lseSumTmp + i * dealCount);
+        Reg::Div<T, Reg::MaskMergeMode::ZEROING>(vregLseSumTmp, vregLseSumTmp, vregLseSum, pregTailN);
+        Reg::StoreAlign<T, Reg::DataCopyMode::DATA_BLOCK_COPY, Reg::PostLiteral::POST_MODE_UPDATE>(
+            (__ubuf__ float *&)lseUb, vregLseSumTmp, blockStride, repeatStride, pregTailN);
+    }
+}
+
+template <typename T, typename SINK_T, SinkInjectStage SINK_INJECT_STAGE = SinkInjectStage::AT_FD_EPILOGUE>
 __aicore__ inline void ComputeScaleValue_8_FD(const LocalTensor<SINK_T> &tmpSinkUb, const LocalTensor<T> &lseMaxUb,
                                               const LocalTensor<T> &lseSumUb, const LocalTensor<T> &lseResUb,
                                               const LocalTensor<T> &lseOutputUb, const LocalTensor<T> &lseMaxReduceUb,
                                               uint32_t dealRowCount, uint32_t actualCombineLoopSize,
-                                              bool softmaxLseFlag, bool learnableSinkFlag)
+                                              bool softmaxLseFlag, bool learnableSinkFlag,
+                                              float minCheckValue = FLT_MAX_NEW)
 {
     uint32_t dealCount = dealRowCount * 8;
     uint16_t i = 0;
@@ -342,9 +427,9 @@ __aicore__ inline void ComputeScaleValue_8_FD(const LocalTensor<SINK_T> &tmpSink
     if (learnableSinkFlag) {
         learnableSinkFlagUint = 1;
     }
-    ComputeScaleValue_8_VF_FD<T, SINK_T>(lseSink, lseMax, lseMaxTmp, lseSum, lseSumTmp, lseOutUb, lseUb, lseMaxReduce,
-                                         dealCount, i, dealRowCount, actualCombineLoopSize, softmaxLseFlagUint,
-                                         learnableSinkFlagUint);
+    ComputeScaleValue_8_VF_FD<T, SINK_T, SINK_INJECT_STAGE>(
+        lseSink, lseMax, lseMaxTmp, lseSum, lseSumTmp, lseOutUb, lseUb, lseMaxReduce, dealCount, i, dealRowCount,
+        actualCombineLoopSize, softmaxLseFlagUint, learnableSinkFlagUint, minCheckValue);
 }
 
 // 处理8<g<=16的场景
@@ -433,8 +518,7 @@ __simd_vf__ void ComputeScaleValue_16_VF(__ubuf__ uint16_t *lseSink, __ubuf__ ui
         Reg::MaskReg pregCompare;
         Reg::MaskReg pregCompare2;
         constexpr float infValue = 3e+99; // 3e+99 for float inf
-        constexpr uint32_t tmpMin = 0xFF167699;
-        float minValue = *((float *)&tmpMin);
+        constexpr float minValue = -FLT_MAX_NEW;
         Reg::Duplicate<float, float>(vregMinValue, minValue);
         Reg::Duplicate<float, float>(vregInfValue, infValue);
 
@@ -508,15 +592,44 @@ __aicore__ inline void ComputeScaleValue_VF(const LocalTensor<SINK_T> &tmpSinkUb
 
 // gqa 非量化走这个模板函数，目前dealRowCount默认为8
 // lseResUb为ScaleValue的计算结果UB
-template <typename T, typename SINK_T>
+template <typename T, typename SINK_T, SinkInjectStage SINK_INJECT_STAGE = SinkInjectStage::AT_FD_EPILOGUE>
 __aicore__ inline void ComputeScaleValue_VF_FD(const LocalTensor<SINK_T> &tmpSinkUb, const LocalTensor<T> &lseMaxUb,
                                                const LocalTensor<T> &lseSumUb, const LocalTensor<T> &lseResUb,
                                                const LocalTensor<T> &lseOutputUb, const LocalTensor<T> &lseMaxUbTmp,
                                                uint32_t dealRowCount, uint32_t actualCombineLoopSize,
-                                               bool softmaxLseFlag, bool learnableSinkFlag)
+                                               bool softmaxLseFlag, bool learnableSinkFlag,
+                                               float minCheckValue = FLT_MAX_NEW)
 {
-    ComputeScaleValue_8_FD(tmpSinkUb, lseMaxUb, lseSumUb, lseResUb, lseOutputUb, lseMaxUbTmp, dealRowCount,
-                           actualCombineLoopSize, softmaxLseFlag, learnableSinkFlag);
+    ComputeScaleValue_8_FD<T, SINK_T, SINK_INJECT_STAGE>(tmpSinkUb, lseMaxUb, lseSumUb, lseResUb, lseOutputUb,
+                                                         lseMaxUbTmp, dealRowCount, actualCombineLoopSize,
+                                                         softmaxLseFlag, learnableSinkFlag, minCheckValue);
+}
+
+// minCheckValue 经 UB 传递的 FD 变体：判值由调用方预先全向量广播写入 minCheckUb
+// （参考 CalcMinCheckValueVF），规避 __simd_vf__ 末位运行时标量在 AIV 首次调用丢失的问题，
+// 详见 ComputeScaleValue_8_VF_FD_MinUb 注释。
+template <typename T, typename SINK_T, SinkInjectStage SINK_INJECT_STAGE = SinkInjectStage::AT_FD_EPILOGUE>
+__aicore__ inline void ComputeScaleValue_VF_FD_MinUb(const LocalTensor<SINK_T> &tmpSinkUb,
+                                                     const LocalTensor<T> &lseMaxUb, const LocalTensor<T> &lseSumUb,
+                                                     const LocalTensor<T> &lseResUb, const LocalTensor<T> &lseOutputUb,
+                                                     const LocalTensor<T> &lseMaxReduceUb,
+                                                     const LocalTensor<float> &minCheckUb, uint32_t dealRowCount,
+                                                     uint32_t actualCombineLoopSize, bool softmaxLseFlag,
+                                                     bool learnableSinkFlag)
+{
+    uint32_t dealCount = dealRowCount * 8;
+    __ubuf__ T *lseSink = (__ubuf__ T *)tmpSinkUb.GetPhyAddr();
+    __ubuf__ T *lseMaxTmp = (__ubuf__ T *)lseMaxUb.GetPhyAddr();
+    __ubuf__ T *lseSumTmp = (__ubuf__ T *)lseSumUb.GetPhyAddr();
+    __ubuf__ T *lseOutUb = (__ubuf__ T *)lseOutputUb.GetPhyAddr();
+    __ubuf__ T *lseUb = (__ubuf__ T *)lseResUb.GetPhyAddr();
+    __ubuf__ T *lseMaxReduce = (__ubuf__ T *)lseMaxReduceUb.GetPhyAddr();
+    __ubuf__ float *minCheck = (__ubuf__ float *)minCheckUb.GetPhyAddr();
+    uint16_t softmaxLseFlagUint = softmaxLseFlag ? 1 : 0;
+    uint16_t learnableSinkFlagUint = learnableSinkFlag ? 1 : 0;
+    ComputeScaleValue_8_VF_FD_MinUb<T, SINK_T, SINK_INJECT_STAGE>(
+        lseSink, lseMaxTmp, lseSumTmp, lseOutUb, lseUb, lseMaxReduce, minCheck, dealCount, dealRowCount,
+        actualCombineLoopSize, softmaxLseFlagUint, learnableSinkFlagUint);
 }
 
 // 处理g<=8的场景
@@ -532,8 +645,7 @@ __simd_vf__ void ComputeLogSumExp_8_VF(__ubuf__ T *srcSumLocalInt, __ubuf__ T *s
     Reg::RegTensor<float> vregInfValue;
     Reg::MaskReg pregCompare;
     constexpr float infValue = 3e+99; // 3e+99 for float inf
-    constexpr uint32_t tmpMin = 0xFF167699;
-    float minValue = *((float *)&tmpMin);
+    constexpr float minValue = -FLT_MAX_NEW;
     Reg::Duplicate<float, float>(vregMinValue, minValue);
     Reg::Duplicate<float, float>(vregInfValue, infValue);
 
@@ -583,8 +695,7 @@ __simd_vf__ void ComputeLogSumExp_16_VF(__ubuf__ T *srcSumUb, __ubuf__ T *srcSum
     Reg::MaskReg pregCompare;
     Reg::MaskReg pregCompare2;
     constexpr float infValue = 3e+99; // 3e+99 for float inf
-    constexpr uint32_t tmpMin = 0xFF167699;
-    float minValue = *((float *)&tmpMin);
+    constexpr float minValue = -FLT_MAX_NEW;
     Reg::Duplicate<float, float>(vregMinValue, minValue);
     Reg::Duplicate<float, float>(vregInfValue, infValue);
 
