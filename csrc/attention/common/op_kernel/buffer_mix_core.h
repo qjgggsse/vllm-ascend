@@ -23,11 +23,16 @@
 #endif
 using namespace AscendC;
 namespace fa_base_matmul {
+// 核间同步中，AIC(flagId 0-10)对应AIV0(flagId 0-10)，对应AIV1(flagId 16-26)
+#define AIV0_AIV1_OFFSET 16
+
 __BLOCK_LOCAL__ __inline__ uint32_t idCounterNum;
 #define MAKE_ID ((++idCounterNum) % 11)
 
-// 核间同步中，AIC(flagId 0-10)对应AIV0(flagId 0-10)，对应AIV1(flagId 16-26)
-#define AIV0_AIV1_OFFSET 16
+__aicore__ inline void ResetIdCounter()
+{
+    idCounterNum = 0;
+}
 
 enum class BufferType {
     L1 = 0,
@@ -43,6 +48,16 @@ enum class SyncType {
     INNER_CORE_SYNC,
     CROSS_CORE_SYNC_FORWARD,
     CROSS_CORE_SYNC_BOTH,
+};
+
+enum class SyncMode {
+    SET_WAIT_FLAG,
+    LOCK_UNLOCK,
+};
+
+enum class IdSource {
+    INTERNAL, // TPipe自动分配
+    EXTERNAL, // 用户自定义, 需要用户传入EventId
 };
 
 constexpr uint32_t INVALID_CROSS_CORE_EVENT_ID = 16;
@@ -106,7 +121,8 @@ struct BufferInfo {
 // L0A buffer的生产者为MTE1，消费者为M
 // L0B buffer的生产者为MTE1，消费者为M
 // L0C buffer的生产者为M，消费者为FIX
-template <BufferType bufferType, SyncType syncType = SyncType::INNER_CORE_SYNC>
+template <BufferType bufferType, SyncType syncType = SyncType::INNER_CORE_SYNC,
+          SyncMode syncMode = SyncMode::SET_WAIT_FLAG>
 class Buffer {
     using TensorType = std::conditional_t<bufferType == BufferType::GM, GlobalTensor<uint8_t>, LocalTensor<uint8_t>>;
 
@@ -114,9 +130,7 @@ class Buffer {
     using TargetTensorType = std::conditional_t<bufferType == BufferType::GM, GlobalTensor<T>, LocalTensor<T>>;
 
 public:
-    __aicore__ inline Buffer()
-    {
-    }
+    __aicore__ inline Buffer() {}
     __aicore__ inline Buffer(TensorType tensor, uint32_t size)
     {
         tensor_ = tensor;
@@ -133,8 +147,10 @@ public:
         }
     }
 
+    template <IdSource idSource = IdSource::INTERNAL>
     __aicore__ inline void Init()
     {
+        static_assert(idSource == IdSource::INTERNAL, "idSource should IdSource::INTERNAL.");
         if constexpr (syncType == SyncType::INNER_CORE_SYNC) {
             p2cEventId_ = GetTPipePtr()->AllocEventID<BufferInfo<bufferType>::EventP2C>(); // 确保只能被调用一次
             c2pEventId_ = GetTPipePtr()->AllocEventID<BufferInfo<bufferType>::EventC2P>();
@@ -142,8 +158,10 @@ public:
         }
     }
 
+    template <IdSource idSource = IdSource::INTERNAL>
     __aicore__ inline void UnInit()
     {
+        static_assert(idSource == IdSource::INTERNAL, "idSource should IdSource::INTERNAL.");
         if constexpr (syncType == SyncType::INNER_CORE_SYNC) {
             WaitFlag<BufferInfo<bufferType>::EventC2P>(c2pEventId_);
             GetTPipePtr()->ReleaseEventID<BufferInfo<bufferType>::EventP2C>(p2cEventId_); // 确保只能被调用一次
@@ -175,8 +193,10 @@ public:
         }
     }
 
+    template <IdSource idSource = IdSource::INTERNAL>
     __aicore__ inline void SetEventID()
     {
+        static_assert(idSource == IdSource::INTERNAL, "idSource should IdSource::INTERNAL.");
         p2cEventId_ = GetTPipePtr()->AllocEventID<BufferInfo<bufferType>::EventP2C>(); // 确保只能被调用一次
         c2pEventId_ = GetTPipePtr()->AllocEventID<BufferInfo<bufferType>::EventC2P>();
     }
@@ -192,16 +212,16 @@ public:
     }
 
     template <typename T>
-    __aicore__ inline TargetTensorType<T> GetTensor()
-    {
-        return tensor_.template ReinterpretCast<T>();
-    }
-
-    template <typename T>
     __aicore__ inline TargetTensorType<T> GetTensor(uint64_t startindex)
     {
         TargetTensorType<T> tmpTensor = tensor_.template ReinterpretCast<T>();
         return tmpTensor[startindex];
+    }
+
+    template <typename T>
+    __aicore__ inline TargetTensorType<T> GetTensor()
+    {
+        return tensor_.template ReinterpretCast<T>();
     }
 
 private:
