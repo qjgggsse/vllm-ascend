@@ -33,7 +33,11 @@ def test_attention_retains_caller_owned_cache_and_sinks():
     cache = torch.zeros(2, 32, 1, 258, dtype=torch.uint8)
     sinks = torch.zeros(4)
     with patch.object(torch.ops._C_ascend, "mixed_quant_sparse_flash_mla", create=True) as op:
-        mixed_quant_sparse_flash_mla(q, cmp_kv=cache, sinks=sinks, cmp_ratio=4)
+        mixed_quant_sparse_flash_mla(
+            q, cmp_kv=cache, sinks=sinks, cmp_ratio=4, seqused_kv=torch.tensor([132], dtype=torch.int32)
+        )
+    assert "seqused_cmp_kv" not in op.call_args.kwargs
+    assert "cmp_residual_kv" not in op.call_args.kwargs
     assert op.call_args.args[0] is q
     assert op.call_args.kwargs["cmp_kv"] is cache
     assert op.call_args.kwargs["sinks"] is sinks

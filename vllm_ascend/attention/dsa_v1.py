@@ -668,6 +668,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.block_table: torch.Tensor = None
         self.common_ratio_to_sas_metadata: dict | None = None
         self.seq_lens: torch.Tensor = None
+        self.tq_group_block_sizes: torch.Tensor | None = None
 
         # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
         self.compressor_ratio = getattr(
@@ -883,10 +884,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # describe only uncompressed SWA/state caches; C4/C128 physical slots
         # are generated later from the logical block table by compressor_metadata.
         if self.compressor_ratio <= 1:
-            slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-            self.slot_mapping[:num_input_tokens] = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
-                slot_mapping, self.storage_block_size
-            )
+            formatted_slots = kwargs.get("formatted_slot_mapping")
+            if formatted_slots is None:
+                slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+                formatted_slots = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
+                    slot_mapping, self.storage_block_size
+                )
+            self.slot_mapping[:num_input_tokens].copy_(formatted_slots[:num_input_tokens])
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata(
@@ -972,23 +976,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_q: int,
         max_seqlen_kv: int,
     ) -> torch.Tensor:
+        # Each cache-group builder owns these buffers, even when the QLI tiling
+        # metadata is shared. Refresh them in place for every builder and step.
+        seq_lens_i32 = seq_lens
+        if seq_lens_i32.dtype != torch.int32:
+            seq_lens_i32 = seq_lens_i32.to(torch.int32)
+        num_reqs = seq_lens_i32.shape[0]
+        qli_seqused_k = self.qli_seqused_k[:num_reqs]
+        qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs]
+        torch.div(seq_lens_i32, 4, rounding_mode="floor", out=qli_seqused_k)
+        torch.remainder(seq_lens_i32, 4, out=qli_cmp_residual_k)
+
         qli_metadata = metadata_cache.get("qli")
         if qli_metadata is None:
-            # QLI v2 PA_BBND reads the compressed K length plus the residual
-            # from the original length. Write both into persistent builder
-            # buffers so their addresses remain stable during graph replay.
-            seq_lens_i32 = seq_lens
-            if seq_lens_i32.dtype != torch.int32:
-                seq_lens_i32 = seq_lens_i32.to(torch.int32)
-            num_reqs = seq_lens_i32.shape[0]
-            qli_seqused_k = self.qli_seqused_k[:num_reqs]
-            qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs]
-            torch.div(seq_lens_i32, 4, rounding_mode="floor", out=qli_seqused_k)
-            torch.remainder(
-                seq_lens_i32,
-                4,
-                out=qli_cmp_residual_k,
-            )
             qli_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
                 num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
@@ -1212,12 +1212,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
             )
-            qli_metadata = self._build_qli_metadata(
-                metadata_cache=metadata_cache,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
+            qli_metadata = (
+                self._build_qli_metadata(
+                    metadata_cache=metadata_cache,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
+                if self.compressor_ratio == 4
+                else None
             )
 
         full_compress_cos, full_compress_sin = None, None

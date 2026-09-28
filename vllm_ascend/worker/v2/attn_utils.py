@@ -47,6 +47,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
@@ -292,6 +293,8 @@ def build_attn_metadata(
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
+    batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
+    formatted_slot_mappings = None
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -344,11 +347,35 @@ def build_attn_metadata(
                 else {}
             )
             if is_dsa_builder:
+                if batch_tq_slots and formatted_slot_mappings is None:
+                    # Metadata preparation can run outside the global config
+                    # context. Use the builder's config and convert all groups
+                    # once; builders retain their capture-stable output buffers.
+                    block_sizes = attn_metadata_builder.tq_group_block_sizes
+                    if (
+                        block_sizes is None
+                        or block_sizes.dtype != slot_mappings.dtype
+                        or block_sizes.device != slot_mappings.device
+                    ):
+                        # Group geometry is fixed for this builder. Recreating
+                        # this device tensor per step would synchronize H2D.
+                        block_sizes = torch.tensor(
+                            [get_storage_block_size(group.kv_cache_spec) for group in kv_cache_groups],
+                            dtype=slot_mappings.dtype,
+                            device=slot_mappings.device,
+                        ).unsqueeze(1)
+                        attn_metadata_builder.tq_group_block_sizes = block_sizes
+                    plan = get_dsa_attn_kv_plan(attn_metadata_builder.vllm_config)
+                    formatted_slot_mappings = plan.format_dsa_slot_mapping(
+                        slot_mappings[:, :num_input_tokens], block_sizes
+                    )
                 # DSA cache groups share request-level metadata during replay.
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                 )
+                if formatted_slot_mappings is not None:
+                    attn_metadata_extra_kwargs["formatted_slot_mapping"] = formatted_slot_mappings[i]
             # Parallel attention and cache-only backends opt in to the PCP
             # context needed to construct their own metadata.
             if pcp_context is not None and (is_sfa_builder or is_dsa_builder or consumes_pcp_context):

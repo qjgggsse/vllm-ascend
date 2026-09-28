@@ -21,11 +21,12 @@ def _adapt(kwargs):
     if "max_seqlen_kv" in kwargs:
         kwargs["max_seqlen_ori_kv"] = kwargs.pop("max_seqlen_kv")
     _drop_paged_kv_cu_seqlens(kwargs)
-    _add_compressed_kv_lengths(kwargs)
 
 
 def mixed_quant_sparse_flash_mla_metadata(**kwargs):
     _adapt(kwargs)
+    # Metadata requires explicit compressed lengths; fused TQ attention derives them.
+    _add_compressed_kv_lengths(kwargs)
     return torch.ops._C_ascend.mixed_quant_sparse_flash_mla_metadata(**kwargs)
 
 

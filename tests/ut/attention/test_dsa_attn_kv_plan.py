@@ -97,6 +97,23 @@ def test_non_a5_plan_preserves_shared_kv_runtime_kwargs():
         assert "cu_seqlens_ori_kv" in kwargs
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_batched_slot_conversion_matches_independent_groups(dtype):
+    with _on(AscendDeviceType.A3):
+        plan = get_dsa_attn_kv_plan(_cache_config("turboquant_4bit_nc"))
+    slots = torch.tensor(
+        [[0, 7, 8, -1, -5, 65537], [31, 32, 63, 64, -1, 98765], [127, 128, 129, -1, 0, 1000001]],
+        dtype=dtype,
+    )
+    slots = slots[:, :5]  # The runner slices active tokens from a wider buffer.
+    block_sizes = torch.tensor([8, 32, 128], dtype=dtype).unsqueeze(1)
+    expected = torch.stack([plan.format_dsa_slot_mapping(row, size) for row, size in zip(slots, [8, 32, 128])])
+    actual = plan.format_dsa_slot_mapping(slots, block_sizes)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.int32
+    assert (actual[slots < 0] == -1).all()
+
+
 def test_scatter_skips_none_updates():
     with _on(AscendDeviceType.A5):
         plan = get_dsa_attn_kv_plan(_config(False))
@@ -104,6 +121,19 @@ def test_scatter_skips_none_updates():
         with mock.patch.object(torch.ops._C_ascend, "kv_compress_epilog") as epilog:
             plan.dsa_kv_compress_scatter(cache, None, torch.tensor([0], dtype=torch.int32))
             epilog.assert_not_called()
+
+
+@pytest.mark.parametrize("cache_dtype", ["bfloat16", "turboquant_4bit_nc"])
+def test_a3_scatter_uses_padding_safe_writer(cache_dtype):
+    with _on(AscendDeviceType.A3):
+        plan = get_dsa_attn_kv_plan(_cache_config(cache_dtype))
+    cache = torch.zeros(2, 32, 1, 512)
+    updates = torch.ones(3, 1, 512)
+    slots = torch.tensor([[0, 1], [-1, -1], [1, 2]], dtype=torch.int32)
+    with mock.patch("vllm_ascend.attention.dsa_attn_kv_plan.write_cache") as writer:
+        plan.dsa_kv_compress_scatter(cache, updates, slots)
+        writer.assert_called_once_with(cache, updates, slots)
+    torch.ops._C_ascend.npu_scatter_nd_update_sk.assert_not_called()
 
 
 def _cpu_scatter_nd_update_(cache, indices, updates):

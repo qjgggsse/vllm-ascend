@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -18,7 +19,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu import attn_utils as upstream_attn_utils
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.attention import dsa_v1
+from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import (
     AscendDSAC4Backend,
@@ -526,6 +527,7 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
     def __init__(self, calls: list[dict[str, Any]]):
         self.calls = calls
         self.for_cudagraph_capture = False
+        self.tq_group_block_sizes = None
 
     def build_for_cudagraph_capture(
         self,
@@ -554,6 +556,7 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
             "num_actual_reqs": kwargs["num_actual_reqs"],
             "pcp_context": kwargs.get("pcp_context"),
             "pcp_cache_group_idx": kwargs.get("pcp_cache_group_idx"),
+            "formatted_slot_mapping": kwargs.get("formatted_slot_mapping"),
         }
         assert "block_size" not in kwargs
         self.calls.append(call)
@@ -595,6 +598,51 @@ def _make_dsa_metadata_groups():
         ],
     )
     return layer_names, specs, calls, attn_groups, kv_cache_config
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_tq_batched_slots_use_builder_config_without_global_context(monkeypatch, for_capture, dtype):
+    _, specs, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
+    config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="turboquant_4bit_nc"))
+    for group, attn_group in zip(kv_cache_config.kv_cache_groups, attn_groups):
+        group.kv_cache_spec = replace(group.kv_cache_spec, cache_dtype_str="turboquant_4bit_nc")
+        attn_group[0].get_metadata_builder(0).vllm_config = config
+    plan = dsa_attn_kv_plan.get_dsa_attn_kv_plan(config, compress_ratio=4)
+    get_plan = MagicMock(return_value=plan)
+    get_current = MagicMock(side_effect=AssertionError("No global config during metadata preparation"))
+    monkeypatch.setattr(attn_utils, "get_dsa_attn_kv_plan", get_plan)
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", get_current)
+    slots = torch.tensor([[0, 65, -1, 111], [1, 130, -2, 222]], dtype=dtype)
+    metadata_args = dict(
+        attn_groups=attn_groups,
+        num_reqs=1,
+        num_tokens=3,
+        query_start_loc_gpu=torch.tensor([0, 3], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 3], dtype=torch.int32),
+        max_query_len=3,
+        seq_lens=torch.tensor([3], dtype=torch.int32),
+        max_seq_len=3,
+        block_tables=tuple(torch.zeros((1, 1), dtype=torch.int32) for _ in specs),
+        slot_mappings=slots,
+        kv_cache_config=kv_cache_config,
+        for_cudagraph_capture=for_capture,
+    )
+    attn_utils.build_attn_metadata(**metadata_args)
+    get_current.assert_not_called()
+    get_plan.assert_called_once_with(config)
+    for call, spec, row in zip(calls, specs, slots):
+        expected = plan.format_dsa_slot_mapping(row[:3], get_storage_block_size(spec))
+        torch.testing.assert_close(call["formatted_slot_mapping"], expected, rtol=0, atol=0)
+        assert call["for_cudagraph_capture"] == for_capture
+    cached_sizes = attn_groups[0][0].get_metadata_builder(0).tq_group_block_sizes
+    slots.add_(17)
+    attn_utils.build_attn_metadata(**metadata_args)
+    assert attn_groups[0][0].get_metadata_builder(0).tq_group_block_sizes is cached_sizes
+    for call, spec, row in zip(calls[2:], specs, slots):
+        expected = plan.format_dsa_slot_mapping(row[:3], get_storage_block_size(spec))
+        torch.testing.assert_close(call["formatted_slot_mapping"], expected, rtol=0, atol=0)
+    get_current.assert_not_called()
 
 
 def test_prepare_kernel_block_sizes_uses_logical_size_for_dsv4():

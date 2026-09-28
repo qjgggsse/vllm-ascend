@@ -16,6 +16,7 @@ from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.quantization.turboquant import is_turboquant
+from vllm_ascend.quantization.turboquant.cache_write import write_cache
 
 _BF16_KV_CACHE_DTYPES = frozenset({"bfloat16", "bf16"})
 
@@ -95,7 +96,7 @@ class DsaAttnKvPlan:
     def get_dsa_compressor_slot_mapping_format(self) -> int:
         return self.compressor_slot_mapping_format
 
-    def format_dsa_slot_mapping(self, slot_mapping: torch.Tensor, block_size: int) -> torch.Tensor:
+    def format_dsa_slot_mapping(self, slot_mapping: torch.Tensor, block_size: int | torch.Tensor) -> torch.Tensor:
         if not self.requires_block_offset_slots:
             return slot_mapping
         valid = slot_mapping >= 0
@@ -120,7 +121,7 @@ class DsaAttnKvPlan:
             torch_npu.npu_scatter_nd_update_(flat_cache, indices, updates)
             return
         if not self.uses_kv_compress_epilog:
-            torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, slot_mapping, x)
+            write_cache(cache, x, slot_mapping)
             return
         torch.ops._C_ascend.kv_compress_epilog(
             kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),

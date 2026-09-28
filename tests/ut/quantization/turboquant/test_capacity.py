@@ -31,6 +31,10 @@ class PageSpec(MLAAttentionSpec):
     def real_page_size_bytes(self):
         return self.payload_bytes
 
+    @property
+    def unpadded_page_size_bytes(self):
+        return self.payload_bytes
+
 
 def mixed_specs(tq, block_size=128):
     cache_dtype = "turboquant_4bit_nc" if tq else "bfloat16"
@@ -61,13 +65,13 @@ def mixed_specs(tq, block_size=128):
     state4 = {
         f"state4.{i}": SlidingWindowMLASpec(
             block_size=block_size // 16, num_kv_heads=1, head_size=2048,
-            dtype=torch.float32, sliding_window=8,
+            dtype=torch.float32, sliding_window=8, page_size_padded=block_size * 1024,
         ) for i in range(21)
     }
     index_state = {
         f"index_state.{i}": SlidingWindowMLASpec(
             block_size=block_size // 16, num_kv_heads=1, head_size=512,
-            dtype=torch.float32, sliding_window=8,
+            dtype=torch.float32, sliding_window=8, page_size_padded=block_size * 130,
         ) for i in range(21)
     }
     state128 = {
@@ -90,6 +94,32 @@ def test_tq_planner_detects_pipeline_rank_without_c4():
     assert all(spec.head_size == 512 for group in groups for spec in group.kv_cache_spec.kv_cache_specs.values())
     baseline = cache.group_specs([mixed_specs(tq=False)[1]])
     assert not cache.uses_turboquant_groups(baseline)
+
+
+def test_c4_grouping_preserves_nonquantized_specs_and_state_padding():
+    grouped = mixed_specs(tq=True)
+    states = {
+        name: replace(spec, page_size_padded=128 * (130 if name.startswith("index_state") else 1024))
+        for name, spec in grouped[3].kv_cache_specs.items()
+    }
+    grouped[3] = UniformTypeKVCacheSpecs.from_specs(states)
+    before = {name: spec for group in grouped for name, spec in group.kv_cache_specs.items()}
+    groups = cache.group_specs(grouped)
+    after = {name: spec for group in groups for name, spec in group.kv_cache_spec.kv_cache_specs.items()}
+    assert before.keys() == after.keys()
+    assert all(after[name] is spec for name, spec in before.items())
+    c4_names = set(grouped[0].kv_cache_specs)
+    assert sum(bool(c4_names.intersection(group.layer_names)) for group in groups) == 1
+    assert len(groups) == 16
+
+
+def test_common_stride_uses_largest_group_without_page_bin_fragmentation():
+    groups = cache.group_specs(mixed_specs(tq=True))
+    largest_group = max(group.kv_cache_spec.page_size_bytes for group in groups)
+    # lcm(256-byte PA alignment, 258-byte compact row) = 33024 bytes.
+    stride = cache.pool_bytes_per_block(groups)
+    assert stride == ((largest_group + 33023) // 33024) * 33024
+    assert stride % 256 == stride % 258 == 0
 
 
 @pytest.mark.parametrize("block_size", [32, 64, 128])
@@ -134,8 +164,24 @@ def test_mixed_cache_capacity_and_normalization(block_size, max_model_len):
         assert capacities[-1] == num_blocks / blocks_per_request
         if tq:
             assert cache.max_memory_usage(config, groups) == divisor * blocks_per_request
+            # Compare the physical pool with identical groups and non-C4
+            # specs, restoring only the C4 main cache to BF16. This isolates
+            # quantization from changes to state padding or group counts.
+            unquantized_groups = []
+            for group in groups:
+                specs = {
+                    name: replace(spec, head_size=512, dtype=torch.bfloat16,
+                                  cache_dtype_str="bfloat16", payload_bytes=block_size * 1024)
+                    if name.startswith("c4.") else spec
+                    for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+                }
+                unquantized_groups.append(KVCacheGroupSpec(
+                    layer_names=list(specs), kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(specs)))
+            assert divisor < cache.pool_bytes_per_block(unquantized_groups)
         # Rank normalization must reproduce the chosen block count exactly.
         if tq:
             assert (num_blocks * divisor) // cache.pool_bytes_per_block(groups) == num_blocks
-    assert capacities[1] > capacities[0] * 1.5
+    # State precision/padding is retained. The total capacity gain includes
+    # pool slack and cannot be inferred from the C4-only 1024/258 ratio.
+    assert capacities[1] > capacities[0]
     print(f"length={max_model_len}, block={block_size}: baseline={capacities[0]:.3f}x, TQ={capacities[1]:.3f}x")

@@ -7,7 +7,6 @@ Block IDs can therefore never alias a different block ID in another group.
 """
 
 import math
-from dataclasses import replace
 
 from vllm.logger import logger
 from vllm.utils.math_utils import round_up
@@ -16,11 +15,14 @@ from vllm.v1.core.kv_cache_utils import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
-    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 
 from . import SLOT_BYTES, TURBOQUANT_CACHE_DTYPE
+
+# PA attention's fast copy path requires aligned page starts. Preserve the
+# integral compact-row stride used by ScatterNdUpdate as well.
+PHYSICAL_STRIDE_ALIGNMENT = 256
 
 
 def uses_turboquant_groups(groups):
@@ -38,19 +40,21 @@ def uses_turboquant_groups(groups):
 
 
 def group_specs(grouped_specs):
-    # Use the largest unpadded page as a byte budget for every logical
-    # group. A BF16 layer-count budget would keep reserving BF16-sized pools
-    # for small TQ/indexer pages and mask the actual compression benefit.
-    normalized = [
-        {
-            name: replace(spec, page_size_padded=None) if isinstance(spec, SlidingWindowMLASpec) else spec
-            for name, spec in group.kv_cache_specs.items()
-        }
+    # Keep C4 and its indexer in one metadata group. Preserve all per-layer
+    # specs, including state padding; only C4 values are quantized.
+    largest_page = max(spec.page_size_bytes for group in grouped_specs for spec in group.kv_cache_specs.values())
+    c4_group_bytes = [
+        group.page_size_bytes
         for group in grouped_specs
+        if any(
+            getattr(spec, "cache_dtype_str", None) == TURBOQUANT_CACHE_DTYPE and spec.head_size == SLOT_BYTES
+            for spec in group.kv_cache_specs.values()
+        )
     ]
-    budget = max(spec.page_size_bytes for specs in normalized for spec in specs.values())
+    budget = round_up(max(c4_group_bytes, default=largest_page), largest_page)
     groups = []
-    for specs in normalized:
+    for group in grouped_specs:
+        specs = group.kv_cache_specs
         chunk = {}
         used = 0
         for name, spec in specs.items():
@@ -81,32 +85,20 @@ def _alignment(spec):
 
 def packed_layout(groups):
     specs = {name: spec for group in groups for name, spec in group.kv_cache_spec.kv_cache_specs.items()}
-    page_alignment = math.lcm(*(_alignment(spec) for spec in specs.values()))
-    page_limit = round_up(max(spec.page_size_bytes for spec in specs.values()), page_alignment)
-    group_slots = []
+    page_alignment = math.lcm(PHYSICAL_STRIDE_ALIGNMENT, *(_alignment(spec) for spec in specs.values()))
+    # A block ID belongs to one group at a time. Overlay complete groups
+    # with a common stride to avoid fragmentation between small-page bins.
+    offsets = {}
+    page_size = 0
     for group in groups:
-        slots, used = [], []
+        used = 0
         for name in sorted(group.layer_names, key=lambda name: -specs[name].page_size_bytes):
             spec = specs[name]
-            for index, size in enumerate(used):
-                offset = round_up(size, _alignment(spec))
-                if offset + spec.page_size_bytes <= page_limit:
-                    slots[index][name] = offset
-                    used[index] = offset + spec.page_size_bytes
-                    break
-            else:
-                slots.append({name: 0})
-                used.append(spec.page_size_bytes)
-        group_slots.append(slots)
-    result = []
-    for index in range(max(map(len, group_slots))):
-        offsets = {
-            name: offset for slots in group_slots if index < len(slots) for name, offset in slots[index].items()
-        }
-        size = max(offset + specs[name].page_size_bytes for name, offset in offsets.items())
-        alignment = math.lcm(*(_alignment(specs[name]) for name in offsets))
-        result.append((round_up(size, alignment), offsets))
-    return result
+            offset = round_up(used, _alignment(spec))
+            offsets[name] = offset
+            used = offset + spec.page_size_bytes
+        page_size = max(page_size, used)
+    return [(round_up(page_size, page_alignment), offsets)]
 
 
 def pool_bytes_per_block(groups):
