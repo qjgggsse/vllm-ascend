@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from vllm_ascend.utils import AscendDeviceType
 
 @pytest.fixture
 def runtime(monkeypatch):
+    monkeypatch.setattr(config, "bootstrap_custom_op_env", Mock())
     monkeypatch.setattr(config, "get_ascend_device_type", lambda: AscendDeviceType.A3)
     monkeypatch.setattr(config.ctypes, "CDLL", lambda _: SimpleNamespace(NnopbaseSupportTensorV2=lambda: True))
     return SimpleNamespace(
@@ -32,6 +34,7 @@ def runtime(monkeypatch):
 def test_valid_runner_v2_configuration(runtime):
     config.validate_turboquant(runtime)
     assert runtime.cache_config.cache_dtype == "turboquant_4bit_nc"
+    config.bootstrap_custom_op_env.assert_called_once_with(include_turboquant=True)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +59,14 @@ def test_invalid_configuration_fails_early(runtime, path, value, message):
     setattr(owner, parts[-1], value)
     with pytest.raises(ValueError, match=message):
         config.validate_turboquant(runtime)
+    config.bootstrap_custom_op_env.assert_not_called()
+
+
+def test_a5_does_not_register_turboquant_environment(runtime, monkeypatch):
+    monkeypatch.setattr(config, "get_ascend_device_type", lambda: AscendDeviceType.A5)
+    with pytest.raises(ValueError, match="A2/A3"):
+        config.validate_turboquant(runtime)
+    config.bootstrap_custom_op_env.assert_not_called()
 
 
 def test_legacy_opbase_cannot_silently_remove_compression(runtime, monkeypatch):
@@ -74,5 +85,6 @@ def test_non_turboquant_configuration_is_unchanged(cache_dtype, monkeypatch):
 
     monkeypatch.setattr(config, "get_ascend_device_type", unexpected_probe)
     monkeypatch.setattr(config.ctypes, "CDLL", unexpected_probe)
+    monkeypatch.setattr(config, "bootstrap_custom_op_env", unexpected_probe)
     config.validate_turboquant(runtime)
     assert vars(runtime) == {"cache_config": SimpleNamespace(cache_dtype=cache_dtype)}

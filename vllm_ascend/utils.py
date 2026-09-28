@@ -405,7 +405,23 @@ def _prepend_env_path(env_name: str, path: str) -> None:
         os.environ[env_name] = ":".join(path_entries)
 
 
-def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
+def bootstrap_custom_op_env(*, include_vendor_lib: bool = False, include_turboquant: bool = False) -> None:
+    # The A2/A3 TurboQuant path opts in after model configuration validation.
+    # Baseline startup does not probe the device or register extra AICPU ops.
+    if include_turboquant and get_ascend_device_type() in (AscendDeviceType.A2, AscendDeviceType.A3):
+        opp_path = envs_ascend.ASCEND_OPP_PATH
+        if opp_path:
+            aicpu_vendor_path = os.path.join(opp_path, "vendors", "ops_transformer_turboquant")
+            aicpu_config = os.path.join(aicpu_vendor_path, "op_impl", "cpu", "config", "cust_aicpu_kernel.json")
+            aicpu_library = os.path.join(
+                aicpu_vendor_path, "op_impl", "cpu", "aicpu_kernel", "impl", "libtransformer_turboquant_aicpu.so"
+            )
+            if os.path.isfile(aicpu_config) and os.path.isfile(aicpu_library):
+                # Match ACLNN lookup: explicit custom packages retain priority.
+                paths = [entry for entry in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(":") if entry]
+                if aicpu_vendor_path not in paths:
+                    os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join([*paths, aicpu_vendor_path])
+
     vendor_path = os.path.join(_CUSTOM_OP_BASE_DIR, "_cann_ops_custom", "vendors", _CUSTOM_OP_VENDOR_DIR)
     if not os.path.exists(vendor_path):
         return

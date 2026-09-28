@@ -16,6 +16,7 @@
 #ifndef OP_API_COMMON_ADAPTER
 #define OP_API_COMMON_ADAPTER
 
+#include <cstring>
 #include <fstream>
 #include <torch/types.h>
 #include <ATen/Tensor.h>
@@ -262,6 +263,8 @@ inline const char *GetTransformerOpApiLibName(void) {
   return "libopapi_transformer.so";
 }
 
+inline const char *GetNnOpApiLibName(void) { return "libopapi_nn.so"; }
+
 inline const char *GetCustOpApiLibName(void) { return "libcust_opapi.so"; }
 
 inline void *GetOpApiFuncAddrInLib(void *handler, const char *libName,
@@ -322,6 +325,19 @@ inline void *GetOpApiFuncAddr(const char *apiName)
             transformerOpApiHandler, GetTransformerOpApiLibName(), apiName);
         if (funcAddr != nullptr) {
             return funcAddr;
+        }
+    }
+
+    // Only TurboQuant adds an NN component lookup; baseline resolution is unchanged.
+    if (std::strcmp(apiName, "aclnnTurboQuant") == 0 ||
+        std::strcmp(apiName, "aclnnTurboQuantGetWorkspaceSize") == 0) {
+        static auto nnOpApiHandler = GetOpApiLibHandler(GetNnOpApiLibName());
+        if (nnOpApiHandler != nullptr) {
+            auto funcAddr = GetOpApiFuncAddrInLib(
+                nnOpApiHandler, GetNnOpApiLibName(), apiName);
+            if (funcAddr != nullptr) {
+                return funcAddr;
+            }
         }
     }
 

@@ -64,6 +64,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # The home path for CANN toolkit. If not set, the default value is
     # /usr/local/Ascend/ascend-toolkit/latest
     "ASCEND_HOME_PATH": lambda: os.getenv("ASCEND_HOME_PATH", None),
+    # Existing CANN OPP root, normally set by CANN's set_env.sh. Unset means
+    # no installed AICPU compatibility vendor is added. This is not sensitive.
+    "ASCEND_OPP_PATH": lambda: os.getenv("ASCEND_OPP_PATH", None),
     # The path for HCCL library, it's used by pyhccl communicator backend. If
     # not set, the default value is libhccl.so.
     "HCCL_SO_PATH": lambda: os.getenv("HCCL_SO_PATH", None),

@@ -6,7 +6,7 @@ import ctypes
 import torch
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, bootstrap_custom_op_env, get_ascend_device_type
 
 from . import TURBOQUANT_CACHE_DTYPE, is_turboquant
 
@@ -46,3 +46,4 @@ def validate_turboquant(vllm_config):
             continue
     else:
         raise ValueError("DeepSeek V4 TurboQuant packed cache requires opbase with NnopbaseSupportTensorV2")
+    bootstrap_custom_op_env(include_turboquant=True)
