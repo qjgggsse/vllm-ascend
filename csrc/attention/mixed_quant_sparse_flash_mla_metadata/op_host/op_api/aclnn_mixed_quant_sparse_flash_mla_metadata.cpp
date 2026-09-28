@@ -64,13 +64,18 @@ aclnnStatus aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize(
                    DFX_OUT(metaData));
 
     auto uniqueExecutor = CREATE_EXECUTOR();
-    OP_CHECK_IF(uniqueExecutor.get() == nullptr,
-                OP_LOGE(MQSMLA_ACLNN_OP_NAME, "Failed to create executor"),
+    OP_CHECK_IF(uniqueExecutor.get() == nullptr, OP_LOGE(MQSMLA_ACLNN_OP_NAME, "Failed to create executor"),
                 return ACLNN_ERR_INNER_CREATE_EXECUTOR);
 
     const op::PlatformInfo &npuInfo = op::GetCurrentPlatformInfo();
-    uint32_t aicCoreNum = npuInfo.GetCubeCoreNum();
-    uint32_t aivCoreNum = npuInfo.GetVectorCoreNum();
+    uint32_t aicCoreNum = 0;
+    uint32_t aivCoreNum = 0;
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_CUBE_CORE, &aicCoreNum) != ACL_SUCCESS) {
+        aicCoreNum = npuInfo.GetCubeCoreNum();
+    }
+    if (aclrtGetResInCurrentThread(ACL_RT_DEV_RES_VECTOR_CORE, &aivCoreNum) != ACL_SUCCESS) {
+        aivCoreNum = npuInfo.GetVectorCoreNum();
+    }
     std::string socVersionStr = npuInfo.GetSocLongVersion();
     const char *socVersion = socVersionStr.c_str();
 
@@ -88,8 +93,7 @@ aclnnStatus aclnnMixedQuantSparseFlashMlaMetadataGetWorkspaceSize(
                            maxSeqlenOriKv, maxSeqlenCmpKv, oriTopk, cmpTopk, ropeHeadDim, cmpRatio, oriMaskMode,
                            cmpMaskMode, oriWinLeft, oriWinRight, layoutQOptional, layoutKvOptional, hasOriKv, hasCmpKv,
                            aicCoreNum, aivCoreNum, socVersion, metaData);
-    OP_CHECK_IF(ret != ACLNN_SUCCESS,
-                OP_LOGE(MQSMLA_ACLNN_OP_NAME, "Parameter check failed: %d", ret), return ret);
+    OP_CHECK_IF(ret != ACLNN_SUCCESS, OP_LOGE(MQSMLA_ACLNN_OP_NAME, "Parameter check failed: %d", ret), return ret);
 
     const aclTensor *cuSeqlensQOptionalContiguous = nullptr;
     if (cuSeqlensQOptional != nullptr) {

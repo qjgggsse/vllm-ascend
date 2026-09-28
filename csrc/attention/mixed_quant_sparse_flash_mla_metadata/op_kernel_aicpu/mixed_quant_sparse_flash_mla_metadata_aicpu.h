@@ -310,7 +310,7 @@ private:
 
     // FD
     bool IsNeedRecordFDInfo(const AssignContext &assignContext, const SplitResult &splitRes);
-    bool IsFirstReductionBlock(const AssignContext &assignContext, const SplitResult &splitRes);
+    bool isFirstReductionBlock(const AssignContext &assignContext, const SplitResult &splitRes);
     void RecordFDInfo(const SplitContext &splitContext, const AssignContext &assignContext, SplitResult &result);
 
     // main
