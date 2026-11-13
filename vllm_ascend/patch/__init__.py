@@ -27,6 +27,14 @@
 # ----------------------------------------------------------------------------------
 
 # What's Patched and how it works:
+# * hisparse/host_pool.py and hisparse/backend.py (enabled backend only):
+#   Target: Core HiSparse Host allocation and worker DMA initialization.
+#   Why: AIV-mapped Host storage must also use PTA's pinned allocator; Ascend
+#        slot mappings use int32 while Core's DMA staging defaults to int64.
+#   How: Retain Core allocation/release ownership and adapt only these hooks.
+#   Future plan: Remove when Core exposes Host-allocation/staging dtype hooks.
+#   HiSparse groups bypass the Ascend coordinator factory to retain Core HMA
+#   admission, eviction, prefix-cache and request-lifetime policies unchanged.
 # --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.

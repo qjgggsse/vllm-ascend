@@ -171,6 +171,10 @@ class NPUPlatform(Platform):
         return True
 
     @classmethod
+    def get_hisparse_backend_cls(cls) -> str:
+        return "vllm_ascend.hisparse.backend.AscendHiSparseBackend"
+
+    @classmethod
     def opaque_attention_op(cls) -> bool:
         return True
 
@@ -617,6 +621,11 @@ class NPUPlatform(Platform):
         if vllm_config.model_config is None:
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
+
+        if vllm_config.attention_config.hisparse_config is not None:
+            from vllm_ascend.hisparse.config import validate_hisparse_config
+
+            validate_hisparse_config(vllm_config)
 
         # vLLM #61392 folds `compress_ratios` into `layer_types`/`compress_rates`.
         # Restore the legacy field before any runner/model/cache component reads
