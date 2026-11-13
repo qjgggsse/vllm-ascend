@@ -1,0 +1,9 @@
+# Local draft: replace 0 and the filename with the assigned PR number before submission.
+pr: 0
+entries:
+  - category: feature
+    text: Added an experimental A3 INT8 C8 HiSparse backend with a native AscendC request-union resolver, reusing Core cache ownership and Host mirroring. Requires the pinned pluggable HiSparse Core; full-model qualification remains pending.
+    hardware: [A3]
+  - category: performance
+    text: Batched decode written-slot invalidation and parallelized fully resident HiSparse index resolution with integer vector compaction on A3. Reused the A5 Target Host mirror overlap with drafting under the same ownership and completion guards, retaining the request-union fallback and Core-owned workspaces.
+    hardware: [A3]
