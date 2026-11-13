@@ -132,8 +132,6 @@ class HardwareCapability(Enum):
     KDA_INT8_QUANT_OVERLAP = auto()
     # Native sparse indexer ABI with INT8 Q/K, FP16 scales and FP32 scores.
     NATIVE_INT8_SPARSE = auto()
-    # Native request-union resolver for Core HiSparse Resident/Hot caches.
-    HISPARSE_RESIDENCY = auto()
     # Reserve host CPUs for interrupt handling when constructing worker CPU pools.
     IRQ_CPU_RESERVATION = auto()
     # Create the local communication resource used by supported KV-transfer deployments.
@@ -306,7 +304,6 @@ _STANDARD_CAPABILITIES = frozenset(
     }
 )
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
-    HardwareCapability.HISPARSE_RESIDENCY,
     HardwareCapability.KDA_INT8_QUANT_OVERLAP,
     HardwareCapability.NATIVE_INT8_SPARSE,
     HardwareCapability.MINIMAX_M3_GBSA_METADATA_REUSE,

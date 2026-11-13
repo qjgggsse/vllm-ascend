@@ -40,7 +40,7 @@ def align_hisparse_indexer_specs(
                 # K and scale occupy separate contiguous regions within each
                 # page. Reserve both before Core computes the layer stride.
                 updates["page_size_padded"] = max(spec.page_size_bytes, spec.page_size_padded or 0)
-                alignment = math.lcm(alignment, spec.head_size, spec.scale_dtype.itemsize)
+                alignment = math.lcm(alignment, spec.head_size, torch.float32.itemsize)
             else:
                 alignment = math.lcm(alignment, spec.page_size_bytes)
         elif packed_row_bytes is not None and isinstance(spec, (HiSparseResidentSpec, HiSparseHotSpec)):

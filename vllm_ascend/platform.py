@@ -622,14 +622,6 @@ class NPUPlatform(Platform):
             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
             return
 
-        if vllm_config.attention_config.hisparse_config is not None:
-            from vllm_ascend.device.device_config import is_950
-
-            if not is_950():
-                from vllm_ascend.hisparse.config import validate_hisparse_config
-
-                validate_hisparse_config(vllm_config)
-
         # vLLM #61392 folds `compress_ratios` into `layer_types`/`compress_rates`.
         # Restore the legacy field before any runner/model/cache component reads
         # it (e.g. NPUModelRunner.__init__ setting `use_compress`).
