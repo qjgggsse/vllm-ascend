@@ -60,6 +60,7 @@ _EXPECTED_CAPABILITIES = {
     },
     AscendDeviceType.A3: _STANDARD_CAPABILITIES
     | {
+        HardwareCapability.HISPARSE_RESIDENCY,
         HardwareCapability.KDA_INT8_QUANT_OVERLAP,
         HardwareCapability.NATIVE_INT8_SPARSE,
         HardwareCapability.MINIMAX_M3_GBSA_METADATA_REUSE,
@@ -84,6 +85,7 @@ _EXPECTED_CAPABILITIES = {
     ),
     AscendDeviceType.A5: frozenset(
         {
+            HardwareCapability.HISPARSE_RESIDENCY,
             HardwareCapability.AUTO_ENABLE_CUSTOM_OPS,
             HardwareCapability.SCATTER_ND_CACHE_STORE,
             HardwareCapability.SCATTER_ND_FP8_CACHE_STORE,
