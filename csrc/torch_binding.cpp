@@ -30,6 +30,9 @@
 #include <torch_npu/csrc/npu/Module.h>
 #include "ops.h"
 #include "utils.h"
+#ifdef VLLM_ASCEND_ENABLE_HISPARSE_RESOLVER
+#include "hisparse/hisparse_resolver_torch_adpt.h"
+#endif
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "moe/rms_norm_cast/rms_norm_cast_torch_adpt.h"
@@ -2811,6 +2814,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 // Pybind on other platform
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
+#ifdef VLLM_ASCEND_ENABLE_HISPARSE_RESOLVER
+#ifdef VLLM_ASCEND_HISPARSE_ARCH22
+    // group_table contains addresses of Runtime-owned tag rows. Mark the
+    // operation mutable so graph compilation retains the indirect writes.
+    ops.def("hisparse_invalidate_written(Tensor(a!) group_table, Tensor states, Tensor requests, "
+            "Tensor written, int state_count, int region) -> ()");
+    ops.impl("hisparse_invalidate_written", torch::kPrivateUse1, &vllm_ascend::hisparse::invalidate_written);
+    ops.impl("hisparse_invalidate_written", torch::kMeta, &vllm_ascend::hisparse::invalidate_written_meta);
+#endif
+    ops.def("hisparse_resolve_residency(Tensor logical, Tensor? requests, Tensor? states, Tensor? source, Tensor? resident, "
+            "Tensor hot_table, Tensor(a!) dgi, Tensor(a!) lru, Tensor(a!) output, Tensor(a!)? attention, "
+            "Tensor(a!) resolved, Tensor(a!)? counts, Tensor(a!)? swap_host, Tensor(a!)? swap_device, "
+            "Tensor(a!)? swap_counts, Tensor(a!)? miss_mask, Tensor(a!)? stats, Tensor(a!) errors, Tensor? valid_rows, "
+            "int host_rows, int hot_block_size, int source_block_size, int resident_block_size, int resident_null_block, "
+            "int attention_block_stride, int union_rows, int attention_capacity=0) -> ()");
+    ops.impl("hisparse_resolve_residency", torch::kPrivateUse1, &vllm_ascend::hisparse::resolve_residency);
+    ops.impl("hisparse_resolve_residency", torch::kMeta, &vllm_ascend::hisparse::resolve_residency_meta);
+    ops.def("hisparse_resolver_validate_scratch(int hot, int union_rows) -> ()",
+            [](int64_t hot, int64_t union_rows) {
+                vllm_ascend::hisparse::resolver_hash_size(hot, union_rows);
+            });
+#endif
     ops.def("get_npu_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor?");
     ops.impl("get_npu_view_from_cpu_tensor", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_npu_view_from_cpu_tensor);
