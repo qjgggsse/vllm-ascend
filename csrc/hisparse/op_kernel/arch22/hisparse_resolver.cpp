@@ -16,6 +16,7 @@ constexpr int32_t kHit = int32_t(0x80000000U);
 constexpr int32_t kMiss = 0x40000000;
 constexpr int32_t kSlotMask = 0xFFFF;
 constexpr int32_t kTile = 256;
+constexpr int32_t kMaxResidentColumns = 1024;
 
 
 template <typename T>
@@ -121,14 +122,14 @@ public:
         Store(address, index, io, 1);
     }
 
-    __aicore__ inline bool PublishResident()
+    __aicore__ inline bool PublishResident(bool allowMixed = false)
     {
         // Reuse the union scratch before constructing any hash/LRU state.
         // Restrict geometry so all vector integer/fp32 conversions are exact;
         // the general union path retains the full ABI outside this fast path.
         const int32_t cols = d.geometry[8];
         if (!d.pointers[3] || !d.pointers[4] || request < 0 || request >= d.geometry[7] ||
-            state >= d.geometry[11] || cols <= 0 || cols > 1024 || cols != d.geometry[12] ||
+            state >= d.geometry[11] || cols <= 0 || cols > kMaxResidentColumns || cols != d.geometry[12] ||
             cols > hashSize || hot < 3072 || topk < kTile || topk > 2048 || topk % kTile ||
             d.geometry[10] != 128 || d.geometry[14] != 128 || d.geometry[16] != 128) return false;
         GlobalTensor<int32_t> source, resident, logical;
@@ -142,6 +143,8 @@ public:
                     DataCopyExtParams{1, uint32_t(cols * 4), 0, 0, 0},
                     DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
         Sync<HardEvent::MTE2_S>();
+        bool hasCold = false;
+        auto coldPages = tags[kMaxResidentColumns].ReinterpretCast<float>();
         for (int32_t col = 0; col < cols; ++col) {
             int32_t hostPage = keys.GetValue(col), devicePage = values.GetValue(col);
             int64_t host = int64_t(hostPage) * 128;
@@ -149,7 +152,10 @@ public:
             else if (host + 127 >= int64_t(d.geometry[3])) return false;
             int64_t device = devicePage >= 0 && devicePage != int64_t(d.geometry[15])
                 ? int64_t(devicePage) * 128 : -128;
-            if (host >= 0 && device < 0) return false;
+            const bool cold = host >= 0 && device < 0;
+            if (cold && !allowMixed) return false;
+            hasCold |= cold;
+            if (allowMixed) coldPages.SetValue(col, cold ? 1.0f : 0.0f);
             int64_t mapped = device < 0 ? -128 : int64_t(devicePage) * d.geometry[19];
             if (device > INT32_MAX - 127 || mapped > INT32_MAX - 127) return false;
             if (d.geometry[23] && mapped >= 0) {
@@ -177,6 +183,49 @@ public:
         Duplicate(zeros, int32_t(0), kTile);
         PipeBarrier<PIPE_V>();
         const bool compact = d.geometry[23] != 0;
+        if (hasCold) {
+            // Only the request leader enters this path. Prove every live row
+            // before publishing anything: a later row may require Hot/LRU
+            // mutation and the fallback then owns the entire request output.
+            for (int32_t row = first; row < end; ++row) {
+                for (int32_t base = 0; base < topk; base += kTile) {
+                    DataCopyPad(token, logical[int64_t(row) * d.geometry[4] + base],
+                                DataCopyExtParams{1, uint32_t(kTile * 4), 0, 0, 0},
+                                DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+                    Sync<HardEvent::MTE2_V>();
+                    Max(safe, token, zeros, kTile);
+                    PipeBarrier<PIPE_V>();
+                    Min(safe, safe, upper, kTile);
+                    PipeBarrier<PIPE_V>();
+                    ShiftRight(column.ReinterpretCast<uint32_t>(), safe.ReinterpretCast<uint32_t>(), uint32_t(7), kTile);
+                    PipeBarrier<PIPE_V>();
+                    ShiftLeft(column.ReinterpretCast<uint32_t>(), column.ReinterpretCast<uint32_t>(), uint32_t(2), kTile);
+                    PipeBarrier<PIPE_V>();
+                    Cast(floats, token, RoundMode::CAST_NONE, kTile);
+                    PipeBarrier<PIPE_V>();
+                    CompareScalar(mask, floats, 0.0f, CMPMODE::GE, kTile);
+                    PipeBarrier<PIPE_V>();
+                    CompareScalar(tokenMask, floats, float(cols * 128), CMPMODE::LT, kTile);
+                    PipeBarrier<PIPE_V>();
+                    And(tokenMask.ReinterpretCast<uint16_t>(), tokenMask.ReinterpretCast<uint16_t>(),
+                        mask.ReinterpretCast<uint16_t>(), kTile / 16);
+                    PipeBarrier<PIPE_V>();
+                    Gather(floats, coldPages, column.ReinterpretCast<uint32_t>(), 0, uint32_t(kTile));
+                    PipeBarrier<PIPE_V>();
+                    CompareScalar(mask, floats, 0.0f, CMPMODE::GT, kTile);
+                    PipeBarrier<PIPE_V>();
+                    And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
+                        tokenMask.ReinterpretCast<uint16_t>(), kTile / 16);
+                    PipeBarrier<PIPE_V>();
+                    Sync<HardEvent::V_S>();
+                    auto words = mask.ReinterpretCast<uint32_t>();
+                    for (int32_t word = 0; word < kTile / 32; ++word) {
+                        if (words.GetValue(word)) return false;
+                    }
+                    Sync<HardEvent::V_MTE2>();
+                }
+            }
+        }
         for (int32_t row = first; row < end; ++row) {
             int32_t count = 0, compactCount = 0;
             for (int32_t base = 0; base < topk; base += kTile) {
@@ -313,6 +362,7 @@ public:
             Publish(false);
             return;
         }
+        if (PublishResident(true)) return;
         for (int32_t h = 0; h < hashSize; ++h) keys.SetValue(h, -1);
         // Construct the entire cold union before inspecting or evicting Hot.
         for (int32_t row = first; row < end; ++row) {

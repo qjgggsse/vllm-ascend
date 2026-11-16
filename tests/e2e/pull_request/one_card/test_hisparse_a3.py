@@ -536,19 +536,18 @@ def test_batched_invalidation_dynamic_graph(dtype, hot_capacity):
 @pytest.mark.parametrize("mask_dtype", [torch.uint8, torch.int32])
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("resident_base", [256, 131073])
-def test_resident_fast_path_dynamic_graph(state_count, mask_dtype, compact, resident_base):
-    """Replay Resident -> mixed -> Resident with complete output comparison."""
+@pytest.mark.parametrize("cols", [9, 1024])
+def test_resident_fast_path_dynamic_graph(state_count, mask_dtype, compact, resident_base, cols):
+    """Replay mixed tables with unselected/selected cold pages and padded rows."""
     torch.manual_seed(19)
-    rows, topk, hot, block, cols = 4, 2048, 4096, 128, 8
+    rows, topk, hot, block = 4, 2048, 4096, 128
     source_cpu = torch.arange(1, state_count * cols + 1, dtype=torch.int32).view(state_count, cols)
     hot_table = torch.arange(1, state_count * (hot // block) + 1, dtype=torch.int32).view(state_count, -1).npu()
     states_cpu = torch.arange(state_count - 1, -1, -1, dtype=torch.int32)
     requests_cpu = torch.tensor([0, 0, 0, 0] if state_count == 1 else [0, 0, 1, 1], dtype=torch.int32)
-    indices_cpu = torch.randint(-1, cols * block, (rows, topk), dtype=torch.int32)
+    indices_cpu = torch.randint(-1, (cols - 1) * block, (rows, topk), dtype=torch.int32)
     indices_cpu[:, :5] = torch.tensor([-1, -(2**31), 2**31 - 1, cols * block, 0])
     indices_cpu[-1].fill_(-1)
-    oracle_indices = indices_cpu.clone()
-    oracle_indices[(oracle_indices < 0) | (oracle_indices >= cols * block)] = -1
     indices, requests, states, source = (x.npu() for x in (indices_cpu, requests_cpu, states_cpu, source_cpu))
     resident = torch.empty_like(source)
     dgi = torch.empty((state_count, hot), dtype=torch.int32, device="npu")
@@ -575,12 +574,26 @@ def test_resident_fast_path_dynamic_graph(state_count, mask_dtype, compact, resi
     with _invalidation_graph(forward) as (graph, stream):
         with torch.npu.graph(graph, stream=stream):
             forward()
-        for mixed, live_rows in ((False, rows), (True, rows), (False, 2), (False, rows)):
+        for cold_page, cold_row, live_rows in (
+            (None, None, rows),
+            (cols - 1, None, rows),
+            (cols - 1, 1, rows),
+            (cols - 1, 1, 1),
+            (0, None, rows),
+            (None, None, 2),
+            (None, None, rows),
+        ):
             resident_cpu = torch.arange(
                 resident_base, resident_base + state_count * cols, dtype=torch.int32
             ).view(state_count, cols)
-            if mixed:
-                resident_cpu[:, 0] = 0
+            if cold_page is not None:
+                resident_cpu[:, cold_page] = 0
+            current_indices = indices_cpu.clone()
+            if cold_row is not None:
+                current_indices[cold_row, 0] = cold_page * block
+            indices.copy_(current_indices)
+            oracle_indices = current_indices.clone()
+            oracle_indices[(oracle_indices < 0) | (oracle_indices >= cols * block)] = -1
             resident.copy_(resident_cpu)
             valid_rows.fill_(live_rows)
             dgi.fill_(-1)

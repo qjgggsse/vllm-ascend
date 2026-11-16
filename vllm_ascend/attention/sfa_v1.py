@@ -1123,7 +1123,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.fused_qkv_a_proj.weight.data = self.fused_qkv_a_proj.weight.data.T
 
         fused_weight = self.fused_qkv_a_proj.weight.data
-        if self.vllm_config.attention_config.hisparse_config is not None and qt is AscendW8A8DynamicLinearMethod:
+        if (
+            qt is AscendW8A8DynamicLinearMethod
+            and self.enable_sparse_sfa_c8
+            and self.c8_cache_dtype == torch.int8
+        ):
             # Slice logical ND weights; INT8 NZ slicing needs unsupported TransData on A3.
             fused_weight = torch_npu.npu_format_cast(fused_weight, ACL_FORMAT_FRACTAL_ND)
         weight_dq = fused_weight[..., : self.q_lora_rank].contiguous()

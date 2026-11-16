@@ -20,7 +20,9 @@ from vllm_ascend.utils import AscendDeviceType, bootstrap_custom_op_env, get_asc
 
 
 @pytest.mark.parametrize("capture", [False, True])
-def test_int8_prolog_resident_writes_match_sfa(capture):
+@pytest.mark.parametrize("hisparse", [False, True])
+def test_int8_prolog_resident_writes_match_sfa(capture, hisparse):
+    """Check INT8 weight slices and resident writes against SFA in eager and graph modes."""
     bootstrap_custom_op_env()
     if not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3:
         pytest.skip("requires A3")
@@ -30,7 +32,7 @@ def test_int8_prolog_resident_writes_match_sfa(capture):
     graph = None
     try:
         impl = AscendHiSparseImpl.__new__(AscendHiSparseImpl)
-        impl.vllm_config = NS(attention_config=NS(hisparse_config=NS()))
+        impl.vllm_config = NS(attention_config=NS(hisparse_config=NS() if hisparse else None))
         impl._quant_type = AscendW8A8DynamicLinearMethod
         impl.use_rope = True
         impl.enable_sparse_sfa_c8 = True
@@ -64,7 +66,10 @@ def test_int8_prolog_resident_writes_match_sfa(capture):
             weight_scale=torch.full((1024,), 0.002, device="npu"),
         )
         impl.W_UK_T = (torch.randn(4, 192, 512, device="npu", dtype=torch.bfloat16) * 0.01).contiguous()
+        expected_weight = torch_npu.npu_format_cast(impl.fused_qkv_a_proj.weight, 2).cpu()
         AscendSFAImpl._process_weights_for_fused_prolog_v3(impl)
+        torch.testing.assert_close(torch_npu.npu_format_cast(impl.weight_dq, 2).cpu(), expected_weight[:, :2048])
+        torch.testing.assert_close(torch_npu.npu_format_cast(impl.weight_dkv_kr, 2).cpu(), expected_weight[:, 2048:])
         local_slots = torch.arange(128, device="npu", dtype=torch.int64)
         raw = torch.zeros(8 * 6 * 128 * 656, device="npu", dtype=torch.int8)
         cache = PagedCacheView.bind(
